@@ -115,6 +115,27 @@ for _col in _LOWER_BETTER:
 _ba = _idx.apply(lambda r: r["Hit_H"] / r["Hit_AB"] if r["Hit_AB"] > 0 else 0, axis=1)
 pct_rank["BA"] = _ba.rank(pct=True)
 
+# Integer ranks (1 = best in league for that stat)
+int_rank: dict = {}
+for _col in _HIGHER_BETTER:
+    if _col in _idx.columns:
+        int_rank[_col] = _idx[_col].rank(ascending=False, method="min").astype(int)
+for _col in _LOWER_BETTER:
+    if _col in _idx.columns:
+        int_rank[_col] = _idx[_col].rank(ascending=True, method="min").astype(int)
+int_rank["BA"] = _ba.rank(ascending=False, method="min").astype(int)
+
+
+def tile_rank(col: str, team: str):
+    """Return integer rank 1-N (1=best) for a team on a stat, or None."""
+    series = int_rank.get(col)
+    if series is None:
+        return None
+    val = series.get(team)
+    if val is None or (hasattr(val, '__class__') and val != val):  # NaN check
+        return None
+    return int(val)
+
 
 def pct_color(col: str, team: str) -> str:
     """Green (high/good) → neutral (mid) → red (low/bad) gradient by percentile."""
@@ -146,15 +167,20 @@ def rank_color(rank: int, n: int) -> str:
     return "#EF4444"
 
 
-def stat_tile(label: str, value: str, sub: str = "", color: str = C_TEXT) -> html.Div:
-    return html.Div([
+def stat_tile(label: str, value: str, sub: str = "", color: str = C_TEXT, rnk: int = None) -> html.Div:
+    _children = [
         html.P(label, style={"margin": "0", "fontSize": "11px",
                               "color": C_MUTED, "textTransform": "uppercase",
                               "letterSpacing": "0.08em"}),
         html.P(value, className="stat-tile-value", style={"margin": "2px 0", "fontSize": "26px",
                               "fontWeight": "700", "color": color}),
         html.P(sub,   style={"margin": "0", "fontSize": "11px", "color": C_MUTED}),
-    ], style={
+    ]
+    if rnk is not None:
+        _children.append(html.P(f"Ranked #{rnk}",
+                                style={"margin": "4px 0 0", "fontSize": "10px",
+                                       "color": C_MUTED, "fontStyle": "italic"}))
+    return html.Div(_children, style={
         "background": C_CARD,
         "borderRadius": "10px",
         "padding": "14px 18px",
@@ -795,27 +821,27 @@ def _team_comparison_col(team: str) -> html.Div:
     tiles = html.Div([
         tile_group("Overall", [
             stat_tile("Rank",       f"#{rank}",                   f"of {n} teams",      r_col),
-            stat_tile("Total SPTS", f"{row['Total_SPTS']:,.0f}",  "projected",          pct_color("Total_SPTS", team)),
-            stat_tile("Hitting",    f"{row['Hit_SPTS']:,.0f}",    "SPTS",               pct_color("Hit_SPTS",   team)),
-            stat_tile("Starting P", f"{row['SP_SPTS']:,.0f}",     "SPTS",               pct_color("SP_SPTS",    team)),
-            stat_tile("Relief P",   f"{row['RP_SPTS']:,.0f}",     "SPTS",               pct_color("RP_SPTS",    team)),
+            stat_tile("Total SPTS", f"{row['Total_SPTS']:,.0f}",  "projected",          pct_color("Total_SPTS", team), rnk=tile_rank("Total_SPTS", team)),
+            stat_tile("Hitting",    f"{row['Hit_SPTS']:,.0f}",    "SPTS",               pct_color("Hit_SPTS",   team), rnk=tile_rank("Hit_SPTS",   team)),
+            stat_tile("Starting P", f"{row['SP_SPTS']:,.0f}",     "SPTS",               pct_color("SP_SPTS",    team), rnk=tile_rank("SP_SPTS",    team)),
+            stat_tile("Relief P",   f"{row['RP_SPTS']:,.0f}",     "SPTS",               pct_color("RP_SPTS",    team), rnk=tile_rank("RP_SPTS",    team)),
         ]),
         tile_group("Batting", [
-            stat_tile("Avg",        f"{ba:.3f}",                  "H/AB (capped)",      pct_color("BA",         team)),
-            stat_tile("BB (bat)",   f"{row.get('Hit_BB',   0):,.0f}", "walks",          pct_color("Hit_BB",     team)),
-            stat_tile("2B",         f"{row.get('Hit_2B',   0):,.0f}", "doubles",        pct_color("Hit_2B",     team)),
-            stat_tile("HR",         f"{row.get('Hit_HR',   0):,.0f}", "hitter HR",      pct_color("Hit_HR",     team)),
-            stat_tile("SB",         f"{row.get('Hit_SB',   0):,.0f}", "stolen bases",   pct_color("Hit_SB",     team)),
-            stat_tile("OPS",        f"{row.get('Hit_OPS',  0):.3f}", "on-base + slug",  pct_color("Hit_OPS",    team)),
-            stat_tile("wOBA",       f"{row.get('Hit_wOBA', 0):.3f}", "weighted on-base",pct_color("Hit_wOBA",   team)),
+            stat_tile("Avg",        f"{ba:.3f}",                  "H/AB (capped)",      pct_color("BA",         team), rnk=tile_rank("BA",         team)),
+            stat_tile("BB (bat)",   f"{row.get('Hit_BB',   0):,.0f}", "walks",          pct_color("Hit_BB",     team), rnk=tile_rank("Hit_BB",     team)),
+            stat_tile("2B",         f"{row.get('Hit_2B',   0):,.0f}", "doubles",        pct_color("Hit_2B",     team), rnk=tile_rank("Hit_2B",     team)),
+            stat_tile("HR",         f"{row.get('Hit_HR',   0):,.0f}", "hitter HR",      pct_color("Hit_HR",     team), rnk=tile_rank("Hit_HR",     team)),
+            stat_tile("SB",         f"{row.get('Hit_SB',   0):,.0f}", "stolen bases",   pct_color("Hit_SB",     team), rnk=tile_rank("Hit_SB",     team)),
+            stat_tile("OPS",        f"{row.get('Hit_OPS',  0):.3f}", "on-base + slug",  pct_color("Hit_OPS",    team), rnk=tile_rank("Hit_OPS",    team)),
+            stat_tile("wOBA",       f"{row.get('Hit_wOBA', 0):.3f}", "weighted on-base",pct_color("Hit_wOBA",   team), rnk=tile_rank("Hit_wOBA",   team)),
         ]),
         tile_group("Pitching", [
-            stat_tile("Total IP",              f"{row['Total_IP']:,.0f}",    "capped",             pct_color("Total_IP",   team)),
-            stat_tile("Pitcher Strikeouts",    f"{row.get('Pit_K',   0):,.0f}", "strikeouts",      pct_color("Pit_K",      team)),
-            stat_tile("Pitcher Walks Allowed", f"{row.get('Pit_BB',  0):,.0f}", "walks allowed",   pct_color("Pit_BB",     team)),
-            stat_tile("Pitcher HR Allowed",    f"{row.get('Pit_HR',  0):,.0f}", "HR allowed",      pct_color("Pit_HR",     team)),
-            stat_tile("FIP",                   f"{row.get('Pit_FIP', 0):.2f}",  "IP-weighted avg", pct_color("Pit_FIP",    team)),
-            stat_tile("SV / HLD",              f"{row['SV']:.0f} / {row['HLD']:.0f}", "capped",   pct_color("SV",         team)),
+            stat_tile("Total IP",              f"{row['Total_IP']:,.0f}",    "capped",             pct_color("Total_IP",   team), rnk=tile_rank("Total_IP",  team)),
+            stat_tile("Pitcher Strikeouts",    f"{row.get('Pit_K',   0):,.0f}", "strikeouts",      pct_color("Pit_K",      team), rnk=tile_rank("Pit_K",     team)),
+            stat_tile("Pitcher Walks Allowed", f"{row.get('Pit_BB',  0):,.0f}", "walks allowed",   pct_color("Pit_BB",     team), rnk=tile_rank("Pit_BB",    team)),
+            stat_tile("Pitcher HR Allowed",    f"{row.get('Pit_HR',  0):,.0f}", "HR allowed",      pct_color("Pit_HR",     team), rnk=tile_rank("Pit_HR",    team)),
+            stat_tile("FIP",                   f"{row.get('Pit_FIP', 0):.2f}",  "IP-weighted avg", pct_color("Pit_FIP",    team), rnk=tile_rank("Pit_FIP",   team)),
+            stat_tile("SV / HLD",              f"{row['SV']:.0f} / {row['HLD']:.0f}", "capped",   pct_color("SV",         team), rnk=tile_rank("SV",        team)),
         ]),
     ], style={"marginBottom": "16px"})
 
@@ -1003,27 +1029,27 @@ def render_report_card(team: str):
     tiles = html.Div([
         tile_group("Overall", [
             stat_tile("Rank",       f"#{rank}",                   f"of {n} teams",      r_col),
-            stat_tile("Total SPTS", f"{row['Total_SPTS']:,.0f}",  "projected",          pct_color("Total_SPTS", team)),
-            stat_tile("Hitting",    f"{row['Hit_SPTS']:,.0f}",    "SPTS",               pct_color("Hit_SPTS",   team)),
-            stat_tile("Starting P", f"{row['SP_SPTS']:,.0f}",     "SPTS",               pct_color("SP_SPTS",    team)),
-            stat_tile("Relief P",   f"{row['RP_SPTS']:,.0f}",     "SPTS",               pct_color("RP_SPTS",    team)),
+            stat_tile("Total SPTS", f"{row['Total_SPTS']:,.0f}",  "projected",          pct_color("Total_SPTS", team), rnk=tile_rank("Total_SPTS", team)),
+            stat_tile("Hitting",    f"{row['Hit_SPTS']:,.0f}",    "SPTS",               pct_color("Hit_SPTS",   team), rnk=tile_rank("Hit_SPTS",   team)),
+            stat_tile("Starting P", f"{row['SP_SPTS']:,.0f}",     "SPTS",               pct_color("SP_SPTS",    team), rnk=tile_rank("SP_SPTS",    team)),
+            stat_tile("Relief P",   f"{row['RP_SPTS']:,.0f}",     "SPTS",               pct_color("RP_SPTS",    team), rnk=tile_rank("RP_SPTS",    team)),
         ]),
         tile_group("Batting", [
-            stat_tile("Avg",        f"{ba:.3f}",                  "H/AB (capped)",      pct_color("BA",         team)),
-            stat_tile("BB (bat)",   f"{row.get('Hit_BB',   0):,.0f}", "walks",          pct_color("Hit_BB",     team)),
-            stat_tile("2B",         f"{row.get('Hit_2B',   0):,.0f}", "doubles",        pct_color("Hit_2B",     team)),
-            stat_tile("HR",         f"{row.get('Hit_HR',   0):,.0f}", "hitter HR",      pct_color("Hit_HR",     team)),
-            stat_tile("SB",         f"{row.get('Hit_SB',   0):,.0f}", "stolen bases",   pct_color("Hit_SB",     team)),
-            stat_tile("OPS",        f"{row.get('Hit_OPS',  0):.3f}", "on-base + slug",  pct_color("Hit_OPS",    team)),
-            stat_tile("wOBA",       f"{row.get('Hit_wOBA', 0):.3f}", "weighted on-base",pct_color("Hit_wOBA",   team)),
+            stat_tile("Avg",        f"{ba:.3f}",                  "H/AB (capped)",      pct_color("BA",         team), rnk=tile_rank("BA",         team)),
+            stat_tile("BB (bat)",   f"{row.get('Hit_BB',   0):,.0f}", "walks",          pct_color("Hit_BB",     team), rnk=tile_rank("Hit_BB",     team)),
+            stat_tile("2B",         f"{row.get('Hit_2B',   0):,.0f}", "doubles",        pct_color("Hit_2B",     team), rnk=tile_rank("Hit_2B",     team)),
+            stat_tile("HR",         f"{row.get('Hit_HR',   0):,.0f}", "hitter HR",      pct_color("Hit_HR",     team), rnk=tile_rank("Hit_HR",     team)),
+            stat_tile("SB",         f"{row.get('Hit_SB',   0):,.0f}", "stolen bases",   pct_color("Hit_SB",     team), rnk=tile_rank("Hit_SB",     team)),
+            stat_tile("OPS",        f"{row.get('Hit_OPS',  0):.3f}", "on-base + slug",  pct_color("Hit_OPS",    team), rnk=tile_rank("Hit_OPS",    team)),
+            stat_tile("wOBA",       f"{row.get('Hit_wOBA', 0):.3f}", "weighted on-base",pct_color("Hit_wOBA",   team), rnk=tile_rank("Hit_wOBA",   team)),
         ]),
         tile_group("Pitching", [
-            stat_tile("Total IP",              f"{row['Total_IP']:,.0f}",    "capped",             pct_color("Total_IP",   team)),
-            stat_tile("Pitcher Strikeouts",    f"{row.get('Pit_K',   0):,.0f}", "strikeouts",      pct_color("Pit_K",      team)),
-            stat_tile("Pitcher Walks Allowed", f"{row.get('Pit_BB',  0):,.0f}", "walks allowed",   pct_color("Pit_BB",     team)),
-            stat_tile("Pitcher HR Allowed",    f"{row.get('Pit_HR',  0):,.0f}", "HR allowed",      pct_color("Pit_HR",     team)),
-            stat_tile("FIP",                   f"{row.get('Pit_FIP', 0):.2f}",  "IP-weighted avg", pct_color("Pit_FIP",    team)),
-            stat_tile("SV / HLD",              f"{row['SV']:.0f} / {row['HLD']:.0f}", "capped",   pct_color("SV",         team)),
+            stat_tile("Total IP",              f"{row['Total_IP']:,.0f}",    "capped",             pct_color("Total_IP",   team), rnk=tile_rank("Total_IP",  team)),
+            stat_tile("Pitcher Strikeouts",    f"{row.get('Pit_K',   0):,.0f}", "strikeouts",      pct_color("Pit_K",      team), rnk=tile_rank("Pit_K",     team)),
+            stat_tile("Pitcher Walks Allowed", f"{row.get('Pit_BB',  0):,.0f}", "walks allowed",   pct_color("Pit_BB",     team), rnk=tile_rank("Pit_BB",    team)),
+            stat_tile("Pitcher HR Allowed",    f"{row.get('Pit_HR',  0):,.0f}", "HR allowed",      pct_color("Pit_HR",     team), rnk=tile_rank("Pit_HR",    team)),
+            stat_tile("FIP",                   f"{row.get('Pit_FIP', 0):.2f}",  "IP-weighted avg", pct_color("Pit_FIP",    team), rnk=tile_rank("Pit_FIP",   team)),
+            stat_tile("SV / HLD",              f"{row['SV']:.0f} / {row['HLD']:.0f}", "capped",   pct_color("SV",         team), rnk=tile_rank("SV",        team)),
         ]),
     ], style={"marginBottom": "20px"})
 
@@ -1117,7 +1143,7 @@ def render_roster_team(team: str):
             tile_group("Roster Overview", [
                 stat_tile("Total Salary",  f"${total_sal:,.0f}",   f"{n_players} players"),
                 stat_tile("Avg Age",       f"{avg_age:.1f}",        "years",
-                          pct_color("Avg_Age", team)),
+                          pct_color("Avg_Age", team), rnk=tile_rank("Avg_Age", team)),
                 stat_tile("SPTS / $1",     f"{spts_per_sal:.2f}",  "efficiency"),
                 stat_tile("Hitter $",      f"${sal_hit:,.0f}",     "batters",   C_HIT),
                 stat_tile("SP $",          f"${sal_sp:,.0f}",      "starters",  C_SP),

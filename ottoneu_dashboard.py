@@ -151,7 +151,7 @@ def stat_tile(label: str, value: str, sub: str = "", color: str = C_TEXT) -> htm
         html.P(label, style={"margin": "0", "fontSize": "11px",
                               "color": C_MUTED, "textTransform": "uppercase",
                               "letterSpacing": "0.08em"}),
-        html.P(value, style={"margin": "2px 0", "fontSize": "26px",
+        html.P(value, className="stat-tile-value", style={"margin": "2px 0", "fontSize": "26px",
                               "fontWeight": "700", "color": color}),
         html.P(sub,   style={"margin": "0", "fontSize": "11px", "color": C_MUTED}),
     ], style={
@@ -848,9 +848,10 @@ _TAB_SEL = {
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
-app = Dash(__name__, title="Ottoneu Power Rankings")
+app = Dash(__name__, title="Ottoneu Power Rankings",
+          meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
 
-app.layout = html.Div(style={
+app.layout = html.Div(className="page-wrap", style={
     "background": C_BG, "minHeight": "100vh",
     "fontFamily": "'Inter', 'Segoe UI', sans-serif",
     "color": C_TEXT, "padding": "24px",
@@ -886,7 +887,7 @@ app.layout = html.Div(style={
                                    config={"displayModeBar": False}),
                          style={"flex": "1", "background": C_CARD,
                                 "borderRadius": "12px", "padding": "12px"}),
-            ], style={"display": "flex", "gap": "16px", "marginBottom": "28px",
+            ], className="flex-row", style={"display": "flex", "gap": "16px", "marginBottom": "28px",
                       "alignItems": "flex-start"}),
 
             # Team selector
@@ -899,9 +900,9 @@ app.layout = html.Div(style={
                     options=[{"label": t, "value": t} for t in teams],
                     value=teams[0],
                     clearable=False,
-                    style={"width": "300px", "color": "#0F172A"},
+                    style={"width": "300px", "maxWidth": "100%", "color": "#0F172A"},
                 ),
-            ], style={"marginBottom": "20px"}),
+            ], className="dropdown-wrap", style={"marginBottom": "20px"}),
 
             # Report card
             html.Div(id="report-card"),
@@ -937,8 +938,8 @@ app.layout = html.Div(style={
                         style={"color": "#0F172A"},
                     ),
                 ], style={"flex": "1"}),
-            ], style={"display": "flex", "gap": "24px",
-                      "marginBottom": "24px", "maxWidth": "600px"}),
+            ], className="flex-row", style={"display": "flex", "gap": "24px",
+                      "marginBottom": "24px"}),
 
             html.Div(id="compare-output"),
         ]),
@@ -958,7 +959,7 @@ app.layout = html.Div(style={
                                    config={"displayModeBar": False}),
                          style={"flex": "1", "background": C_CARD,
                                 "borderRadius": "12px", "padding": "12px"}),
-            ], style={"display": "flex", "gap": "16px", "marginBottom": "24px",
+            ], className="flex-row", style={"display": "flex", "gap": "16px", "marginBottom": "24px",
                       "alignItems": "flex-start"}),
 
             # Age bar (league-wide)
@@ -979,9 +980,9 @@ app.layout = html.Div(style={
                     options=[{"label": t, "value": t} for t in teams],
                     value=teams[0],
                     clearable=False,
-                    style={"width": "300px", "color": "#0F172A"},
+                    style={"width": "300px", "maxWidth": "100%", "color": "#0F172A"},
                 ),
-            ], style={"marginBottom": "20px"}),
+            ], className="dropdown-wrap", style={"marginBottom": "20px"}),
 
             html.Div(id="roster-team-output"),
         ]),
@@ -1039,7 +1040,7 @@ def render_report_card(team: str):
                            config={"displayModeBar": False}),
                  style={"flex": "1", "background": C_CARD,
                         "borderRadius": "12px", "padding": "12px"}),
-    ], style={"display": "flex", "gap": "16px", "marginBottom": "20px"})
+    ], className="flex-row", style={"display": "flex", "gap": "16px", "marginBottom": "20px"})
 
     def section(title, content):
         return html.Div([
@@ -1085,12 +1086,12 @@ def sync_dropdown_from_bar(click_data):
 def render_comparison(team_a: str, team_b: str):
     return html.Div([
         _team_comparison_col(team_a),
-        html.Div(style={
+        html.Div(className="compare-divider", style={
             "width": "1px", "background": C_GRID,
             "alignSelf": "stretch", "margin": "0 8px",
         }),
         _team_comparison_col(team_b),
-    ], style={"display": "flex", "gap": "16px", "alignItems": "flex-start"})
+    ], className="flex-row", style={"display": "flex", "gap": "16px", "alignItems": "flex-start"})
 
 
 # ── Roster & Salary team deep-dive ───────────────────────────────────────────

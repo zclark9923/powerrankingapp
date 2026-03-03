@@ -1,0 +1,57 @@
+/* ────────────────────────────────────────────────────────────
+   Ottoneu Dashboard — Mobile Responsive Overrides
+   Dash auto-serves everything in /assets at startup.
+   ──────────────────────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+
+    /* Reduce outer padding */
+    .page-wrap {
+        padding: 12px !important;
+    }
+
+    /* Shrink the header */
+    .page-wrap > div:first-child h1 {
+        font-size: 18px !important;
+    }
+
+    /* Stack every side-by-side row vertically */
+    .flex-row {
+        flex-direction: column !important;
+    }
+    .flex-row > div {
+        flex: none !important;
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+    }
+
+    /* Hide the thin vertical divider between compare columns */
+    .compare-divider {
+        display: none !important;
+    }
+
+    /* Dropdowns: natural full-width on small screens */
+    .dropdown-wrap .Select,
+    .dropdown-wrap > div {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+
+    /* Tabs: tighter labels so they all fit */
+    .custom-tab {
+        padding: 8px 8px !important;
+        font-size: 11px !important;
+        letter-spacing: 0 !important;
+    }
+
+    /* Tables: let them scroll horizontally rather than squish */
+    .dash-spreadsheet-container {
+        overflow-x: auto !important;
+    }
+
+    /* Slightly smaller stat tile numbers */
+    .stat-tile-value {
+        font-size: 20px !important;
+    }
+}

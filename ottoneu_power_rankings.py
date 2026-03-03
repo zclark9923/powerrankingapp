@@ -5,7 +5,7 @@ Applies actual Ottoneu lineup rules before summing projected SPTS:
 
     HITTERS  (per day):  C · 1B · 2B · SS · MIF · 3B · OF×5 · Util  (12 slots), 140 games
     SP       (per week): 10 starts/week  →  210 total starts/season (21 weeks)
-    RP       (per day):  capped at 500 IP/appearances
+    RP       (per day):  capped at 400 IP/appearances
 
 Position data is pulled from the FanGraphs 2025 batting leaderboard (single
 API request) and merged by FanGraphs PlayerId.
@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore")
 SEASON_WEEKS   = 21          # 21-week scoring season
 SEASON_DAYS    = 140         # regular-season game-days (no playoffs)
 SP_STARTS_CAP  = 10 * SEASON_WEEKS   # 210 starts / season
-RP_APPS_CAP    = 350                 # RP innings/appearances cap
+RP_APPS_CAP    = 400                 # RP innings/appearances cap
 IP_PER_START   = 5.25                 # fallback innings per SP outing (used only when GS = 0)
 
 # ── File paths ────────────────────────────────────────────────────────────────

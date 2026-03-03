@@ -1154,6 +1154,8 @@ def render_roster_team(team: str):
     ])
 
 
+server = app.server  # exposed for gunicorn: `gunicorn ottoneu_dashboard:server`
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8050))
     print(f"Dashboard running → http://127.0.0.1:{port}")

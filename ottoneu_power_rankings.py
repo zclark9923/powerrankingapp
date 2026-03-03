@@ -31,6 +31,7 @@ IP_PER_START   = 5.25                 # fallback innings per SP outing (used onl
 # Roster files  – leaderboard exports that contain the Fantasy/team column
 HITTER_ROSTER_FILE  = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (25).csv"
 PITCHER_ROSTER_FILE = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (26).csv"
+FIELDING_FILE       = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (29).csv"
 # Projection files – ZiPS/Steamer exports that contain the stat projections
 HITTER_PROJ_FILE    = r"C:\Users\Rachel\Downloads\fangraphs-leaderboard-projections (8).csv"
 PITCHER_PROJ_FILE   = r"C:\Users\Rachel\Downloads\fangraphs-leaderboard-projections (9).csv"
@@ -48,26 +49,27 @@ def extract_team(html: str) -> str:
 
 def player_eligible(pos_str: str, slot: str) -> bool:
     """True if a player whose position string can fill the given lineup slot.
+    pos_str may be a slash-delimited multi-position string e.g. '2B/3B/SS/OF'.
     DH players are Util-only (no positional home); all other non-pitchers
     are also Util-eligible.
     """
-    p = str(pos_str).upper().strip()
+    parts = {p.strip().upper() for p in str(pos_str).split("/")}
     if slot == "C":
-        return p == "C"
+        return "C" in parts
     if slot == "1B":
-        return p == "1B"
+        return "1B" in parts
     if slot == "2B":
-        return p == "2B"
+        return "2B" in parts
     if slot == "SS":
-        return p == "SS"
+        return "SS" in parts
     if slot == "MIF":
-        return p in {"2B", "SS"}
+        return bool(parts & {"2B", "SS"})
     if slot == "3B":
-        return p == "3B"
+        return "3B" in parts
     if slot == "OF":
-        return p == "OF"
+        return "OF" in parts
     if slot == "Util":
-        return p not in {"P", "SP", "RP"}
+        return not bool(parts & {"P", "SP", "RP"})
     return False
 
 
@@ -366,7 +368,7 @@ for col in ("SPTS", "IP", "SV", "HLD", "GS", "SO", "BB", "HR", "FIP"):
     else:
         pit_df[col] = 0.0
         if col == "GS":
-            print(f"  ⚠ 'GS' column not found in pitcher projections — IP/start will default to {IP_PER_START}.")
+            print(f"  !! 'GS' column not found in pitcher projections - IP/start will default to {IP_PER_START}.")
             print(f"     Columns found: {list(pit_df.columns)}")
     pit_full[col] = pd.to_numeric(pit_full.get(col, 0), errors="coerce").fillna(0)
 
@@ -426,18 +428,49 @@ for i in range(0, len(all_mlbam_ids), BATCH):
             pos_by_mlbam[person["id"]] = MLB_POS_MAP.get(abbr, POS_FALLBACK)
             age_by_mlbam[person["id"]] = person.get("currentAge")
     except Exception as e:
-        print(f"  ⚠ MLB API batch {i//BATCH+1} failed: {e}")
+        print(f"  !! MLB API batch {i//BATCH+1} failed: {e}")
 
 print(f"  -> {len(pos_by_mlbam):,} player positions + ages loaded.")
+
+# -- Build multi-position eligibility from FanGraphs fielding leaderboard -----
+# Any position with ≥5 games earns eligibility; LF/CF/RF are all mapped to OF.
+_FIELD_POS_ORDER = ["C", "1B", "2B", "SS", "3B", "OF", "DH"]
+_OF_SLOTS        = {"LF", "CF", "RF", "OF"}
+pos_by_playerid: dict = {}
+try:
+    _field = pd.read_csv(FIELDING_FILE)
+    _field["PlayerId"] = _field["PlayerId"].astype(str).str.strip()
+    _field["PosGroup"] = _field["Pos"].str.upper().apply(
+        lambda p: "OF" if p in _OF_SLOTS else p
+    )
+    _field = _field[~_field["PosGroup"].isin(["P", "SP", "RP"])]
+    _agg   = _field.groupby(["PlayerId", "PosGroup"])["G"].sum().reset_index()
+    _elig  = _agg[_agg["G"] >= 5]
+    for _pid, _grp in _elig.groupby("PlayerId"):
+        _positions = [p for p in _FIELD_POS_ORDER if p in _grp["PosGroup"].values]
+        if _positions:
+            pos_by_playerid[str(_pid)] = "/".join(_positions)
+    print(f"  -> {len(pos_by_playerid):,} player multi-position eligibilities loaded from fielding file.")
+except Exception as _fe:
+    print(f"  !! Fielding file not loaded ({_fe}) - falling back to MLB API primary position.")
 
 # Name → MLBAMID lookup built from both roster files (used for Excel headshots)
 _name_to_mlbam: dict = {}
 
 def _apply_pos(df, fallback=POS_FALLBACK):
     df["MLBAMID"] = pd.to_numeric(df["MLBAMID"], errors="coerce")
-    df["Pos"] = df["MLBAMID"].apply(
-        lambda mid: pos_by_mlbam.get(int(mid), fallback) if pd.notna(mid) else fallback
-    )
+    df["PlayerId"] = df["PlayerId"].astype(str).str.strip()
+    def _get_pos(row):
+        # Fielding file first (multi-position eligibility)
+        fp = pos_by_playerid.get(row["PlayerId"])
+        if fp:
+            return fp
+        # Fall back to MLB API primary position
+        mid = row["MLBAMID"]
+        if pd.notna(mid):
+            return pos_by_mlbam.get(int(mid), fallback)
+        return fallback
+    df["Pos"] = df.apply(_get_pos, axis=1)
     df["Age"] = df["MLBAMID"].apply(
         lambda mid: age_by_mlbam.get(int(mid)) if pd.notna(mid) else None
     )
@@ -636,7 +669,7 @@ rankings.index += 1
 # ─────────────────────────────────────────────────────────────────────────────
 W = 140
 print("\n" + "=" * W)
-print(f"{'OTTONEU 2026 POWER RANKINGS  —  Lineup-Constrained  (ZIPS)':^{W}}")
+print(f"{'OTTONEU 2026 POWER RANKINGS  --  Lineup-Constrained  (ZIPS)':^{W}}")
 print("=" * W)
 print(f"{'Rank':<5} {'Team':<14} {'Hit SPTS':>9} {'SP SPTS':>8} {'RP SPTS':>8} "
       f"{'TOTAL':>9}  {'Hit AB':>8} {'Hit H':>8} {'Pit IP':>8} {'SV':>6} {'HLD':>6} "
@@ -662,7 +695,7 @@ print("=" * W)
 
 for rank, row in rankings.iterrows():
     team = row["Team"]
-    print(f"\n{'─'*4} #{rank}  {team}  "
+    print(f"\n{'--'} #{rank}  {team}  "
           f"(Hit: {row['Hit_SPTS']:,.1f} | SP: {row['SP_SPTS']:,.1f} | "
           f"RP: {row['RP_SPTS']:,.1f} | Total: {row['Total_SPTS']:,.1f})")
 
@@ -672,10 +705,10 @@ for rank, row in rankings.iterrows():
         slot_order_idx   = {s: i for i, s in enumerate(SLOT_PRINT_ORDER)}
         lineup_sorted    = sorted(lineup, key=lambda x: (slot_order_idx.get(x["Slot"], 99), -x["SPTS/G"]))
         print(f"  {'SLOT':<6} {'NAME':<28} {'POS':<5} {'G_proj':>6} {'G_used':>6} {'SPTS/G':>7} {'SPTS':>8}")
-        print(f"  {'─'*6} {'─'*28} {'─'*5} {'─'*6} {'─'*6} {'─'*7} {'─'*8}")
+        print(f"  {'-'*6} {'-'*28} {'-'*5} {'-'*6} {'-'*6} {'-'*7} {'-'*8}")
         cur_slot = None
         for p in lineup_sorted:
-            slot_label = p["Slot"] if p["Slot"] != cur_slot else "  ↳"
+            slot_label = p["Slot"] if p["Slot"] != cur_slot else "  +>"
             cur_slot   = p["Slot"]
             print(f"  {slot_label:<6} {p['Name']:<28} {p['Pos']:<5} "
                   f"{p['G_proj']:>6} {p['G_used']:>6.1f} "
@@ -685,7 +718,7 @@ for rank, row in rankings.iterrows():
     if sp_det:
         print(f"\n  Starting Pitchers  (cap: {SP_STARTS_CAP} starts)")
         print(f"  {'NAME':<28} {'GS_proj':>8} {'GS_used':>8} {'IP/GS':>7} {'IP_used':>8} {'SPTS_proj':>10} {'SPTS_used':>10}")
-        print(f"  {'─'*28} {'─'*8} {'─'*8} {'─'*7} {'─'*8} {'─'*10} {'─'*10}")
+        print(f"  {'-'*28} {'-'*8} {'-'*8} {'-'*7} {'-'*8} {'-'*10} {'-'*10}")
         for p in sp_det:
             print(f"  {p['Name']:<28} {p['Proj_Starts']:>8.1f} {p['Used_Starts']:>8.1f} "
                   f"{p['IP_per_GS']:>7.2f} {p['IP_used']:>8.1f} {p['SPTS_proj']:>10.1f} {p['SPTS_used']:>10.1f}")
@@ -693,7 +726,7 @@ for rank, row in rankings.iterrows():
     if rp_det:
         print(f"\n  Relief Pitchers  (cap: {RP_APPS_CAP} IP)")
         print(f"  {'NAME':<28} {'App_proj':>8} {'App_used':>8} {'IP_used':>8} {'SPTS_proj':>10} {'SPTS_used':>10} {'SV_proj':>8} {'SV_used':>8} {'HLD_proj':>9} {'HLD_used':>9}")
-        print(f"  {'─'*28} {'─'*8} {'─'*8} {'─'*8} {'─'*10} {'─'*10} {'─'*8} {'─'*8} {'─'*9} {'─'*9}")
+        print(f"  {'-'*28} {'-'*8} {'-'*8} {'-'*8} {'-'*10} {'-'*10} {'-'*8} {'-'*8} {'-'*9} {'-'*9}")
         for p in rp_det:
             print(f"  {p['Name']:<28} {p['Proj_Apps']:>8.1f} {p['Used_Apps']:>8.1f} "
                   f"{p['IP_used']:>8.1f} {p['SPTS_proj']:>10.1f} {p['SPTS_used']:>10.1f} "

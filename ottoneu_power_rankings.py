@@ -378,7 +378,7 @@ for col in ("SPTS", "IP", "SV", "HLD", "GS", "SO", "BB", "HR", "FIP"):
 # 140-game regular season.  Per-game/per-inning rate columns (SPTS/G, FIP, wOBA,
 # OPS) are NOT scaled — they are already rate stats and remain unchanged.
 _HIT_SCALE_COLS = ["SPTS", "AB", "H", "2B", "BB", "HR", "SB"]
-_PIT_SCALE_COLS = ["SPTS", "IP", "GS", "SV", "HLD"]
+_PIT_SCALE_COLS = ["SPTS", "IP", "GS", "SV", "HLD", "SO", "BB", "HR"]
 for _col in _HIT_SCALE_COLS:
     for _df in (hit_df, hit_full):
         _df[_col] = _df[_col] * SCHEDULE_SCALE

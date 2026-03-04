@@ -218,7 +218,10 @@ _SLOT_COUNTS   = {"C": 1, "1B": 1, "2B": 1, "SS": 1, "MIF": 1, "3B": 1, "OF": 5,
 def usage_bar(label: str, used: float, cap: float, unit: str = "") -> html.Div:
     """Single labeled progress bar: label — colored fill — used / cap."""
     frac = min(used / cap, 1.0) if cap > 0 else 0.0
-    bar_color = "#EF4444" if frac < 0.50 else ("#F59E0B" if frac < 0.80 else "#22C55E")
+    r = int(239 + (34  - 239) * frac)
+    g = int(68  + (197 - 68)  * frac)
+    b = int(68  + (94  - 68)  * frac)
+    bar_color = f"rgb({r},{g},{b})"
     val_text  = f"{used:,.0f} / {cap:,.0f}{' ' + unit if unit else ''}"
     return html.Div([
         html.Span(label, style={"minWidth": "88px", "fontSize": "12px",

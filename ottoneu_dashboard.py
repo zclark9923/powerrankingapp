@@ -209,6 +209,90 @@ def rank_color(rank: int, n: int) -> str:
     return "#EF4444"
 
 
+_SP_STARTS_CAP = 210
+_RP_APPS_CAP   = 400
+_SLOT_G_CAP    = 140
+_SLOT_COUNTS   = {"C": 1, "1B": 1, "2B": 1, "SS": 1, "MIF": 1, "3B": 1, "OF": 5, "Util": 1}
+
+
+def usage_bar(label: str, used: float, cap: float, unit: str = "") -> html.Div:
+    """Single labeled progress bar: label — colored fill — used / cap."""
+    frac = min(used / cap, 1.0) if cap > 0 else 0.0
+    bar_color = "#22C55E" if frac < 0.80 else ("#F59E0B" if frac < 0.96 else "#EF4444")
+    val_text  = f"{used:,.0f} / {cap:,.0f}{' ' + unit if unit else ''}"
+    return html.Div([
+        html.Span(label, style={"minWidth": "88px", "fontSize": "12px",
+                                "color": C_MUTED, "fontWeight": "600",
+                                "flexShrink": "0"}),
+        html.Div(
+            html.Div(style={
+                "height": "100%",
+                "width": f"{frac * 100:.1f}%",
+                "background": bar_color,
+                "borderRadius": "3px",
+            }),
+            style={
+                "flex": "1", "height": "8px", "background": C_GRID,
+                "borderRadius": "3px", "overflow": "hidden",
+                "margin": "0 12px",
+            }
+        ),
+        html.Span(val_text, style={"fontSize": "12px", "color": C_TEXT,
+                                   "minWidth": "110px", "textAlign": "right",
+                                   "flexShrink": "0"}),
+    ], style={"display": "flex", "alignItems": "center", "marginBottom": "7px"})
+
+
+def _cap_usage_block(team: str, ctx=None) -> html.Div:
+    """Pitching caps + position-slot utilization bars for a single team."""
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+
+    sp_team        = ctx.sp_data[ctx.sp_data["Team"] == team]
+    starts_used    = float(sp_team["Used_Starts"].sum()) if not sp_team.empty else 0.0
+
+    rp_team        = ctx.rp_data[ctx.rp_data["Team"] == team]
+    apps_used      = float(rp_team["Used_Apps"].sum()) if not rp_team.empty else 0.0
+
+    hit_team       = ctx.hitters[ctx.hitters["Team"] == team]
+    slot_used      = (hit_team.groupby("Slot")["G_used"].sum()
+                      if not hit_team.empty else pd.Series(dtype=float))
+
+    pit_bars = html.Div([
+        html.P("PITCHING CAPS", style={"margin": "0 0 10px", "fontSize": "10px",
+               "fontWeight": "700", "color": C_MUTED,
+               "textTransform": "uppercase", "letterSpacing": "0.1em"}),
+        usage_bar("SP Starts",  starts_used, _SP_STARTS_CAP, "starts"),
+        usage_bar("RP Apps",    apps_used,   _RP_APPS_CAP,   "apps"),
+        usage_bar("SP IP",      float(sp_team["IP_used"].sum()) if not sp_team.empty else 0.0,
+                  round(_SP_STARTS_CAP * 5.25), "IP"),
+        usage_bar("RP IP",      float(rp_team["IP_used"].sum()) if not rp_team.empty else 0.0,
+                  _RP_APPS_CAP, "IP"),
+    ], style={"flex": "1"})
+
+    slot_bars = html.Div([
+        html.P("LINEUP SLOT UTILIZATION", style={"margin": "0 0 10px", "fontSize": "10px",
+               "fontWeight": "700", "color": C_MUTED,
+               "textTransform": "uppercase", "letterSpacing": "0.1em"}),
+        *[
+            usage_bar(
+                slot,
+                float(slot_used.get(slot, 0)),
+                _SLOT_G_CAP * _SLOT_COUNTS.get(slot, 1),
+                "G",
+            )
+            for slot in ["C", "1B", "2B", "SS", "MIF", "3B", "OF", "Util"]
+        ],
+    ], style={"flex": "1"})
+
+    return html.Div([
+        html.Div([pit_bars, slot_bars],
+                 className="flex-row",
+                 style={"display": "flex", "gap": "32px"}),
+    ], style={"background": C_CARD, "borderRadius": "12px",
+              "padding": "16px 20px", "marginBottom": "20px"})
+
+
 def stat_tile(label: str, value: str, sub: str = "", color: str = C_TEXT, rnk: int = None) -> html.Div:
     _children = [
         html.P(label, style={"margin": "0", "fontSize": "11px",
@@ -1190,7 +1274,7 @@ def render_report_card(team: str, sys_val: str):
     return html.Div([
         html.H2(team, style={"margin": "0 0 16px", "fontSize": "20px",
                               "fontWeight": "700"}),
-        tiles, charts, tables,
+        tiles, _cap_usage_block(team, ctx), charts, tables,
     ])
 
 
@@ -1284,7 +1368,7 @@ def render_roster_team(team: str, sys_val: str):
     return html.Div([
         html.H2(team, style={"margin": "0 0 16px", "fontSize": "20px",
                              "fontWeight": "700"}),
-        tiles, charts, table_section,
+        tiles, charts, _cap_usage_block(team, ctx), table_section,
     ])
 
 

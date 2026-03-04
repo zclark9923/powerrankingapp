@@ -3,6 +3,38 @@
    Dash auto-serves everything in /assets at startup.
    ──────────────────────────────────────────────────────────── */
 
+/* ── Projection system segmented pill control ───────────────────────────── */
+
+.proj-system-radio {
+    display: inline-flex;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+
+.proj-system-radio label {
+    padding: 6px 16px;
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #94A3B8;
+    border: 1px solid transparent;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+}
+
+.proj-system-radio label:hover {
+    background: #263248;
+    color: #F1F5F9;
+}
+
+/* Selected pill — targets label whose hidden input is checked */
+.proj-system-radio label:has(input:checked) {
+    background: #3B82F6;
+    color: #F1F5F9;
+    border-color: #3B82F6;
+}
+
+
 @media (max-width: 768px) {
 
     /* Reduce outer padding */

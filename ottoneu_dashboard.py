@@ -951,20 +951,37 @@ app.layout = html.Div(className="page-wrap", style={
 
     # ── Header
     html.Div([
-        html.H1("⚾ Ottoneu 2026 Power Rankings",
-                style={"margin": "0", "fontSize": "24px", "fontWeight": "800"}),
-        html.P("Lineup-constrained projected SPTS",
-               style={"margin": "4px 0 0", "color": C_MUTED, "fontSize": "13px"}),
-        dcc.RadioItems(
-            id="proj-system-radio",
-            options=[{"label": s, "value": s} for s in _AVAIL_SYSTEMS],
-            value=_DEFAULT_SYS,
-            inline=True,
-            style={"marginTop": "10px", "color": C_MUTED, "fontSize": "13px"},
-            inputStyle={"marginRight": "6px"},
-            labelStyle={"marginRight": "20px", "cursor": "pointer"},
-        ),
-    ], style={"marginBottom": "24px"}),
+        # Left: title + subtitle
+        html.Div([
+            html.H1("⚾ Ottoneu 2026 Power Rankings",
+                    style={"margin": "0", "fontSize": "24px", "fontWeight": "800"}),
+            html.P("Lineup-constrained projected SPTS",
+                   style={"margin": "4px 0 0", "color": C_MUTED, "fontSize": "13px"}),
+        ]),
+        # Right: projection system picker
+        html.Div([
+            html.P("PROJECTION SYSTEM", style={
+                "margin": "0 0 8px", "fontSize": "10px", "fontWeight": "700",
+                "color": C_MUTED, "letterSpacing": "0.1em",
+            }),
+            dcc.RadioItems(
+                id="proj-system-radio",
+                options=[{"label": s, "value": s} for s in _AVAIL_SYSTEMS],
+                value=_DEFAULT_SYS,
+                inline=True,
+                className="proj-system-radio",
+                inputStyle={"display": "none"},
+                labelStyle={"cursor": "pointer"},
+            ),
+        ], style={
+            "background": C_CARD,
+            "border": f"1px solid {C_GRID}",
+            "borderRadius": "12px",
+            "padding": "12px 18px",
+        }),
+    ], style={"display": "flex", "justifyContent": "space-between",
+              "alignItems": "center", "marginBottom": "24px",
+              "flexWrap": "wrap", "gap": "16px"}),
 
     dcc.Tabs(id="main-tabs", value="rankings",
              style={"marginBottom": "24px"},

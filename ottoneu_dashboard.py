@@ -745,6 +745,7 @@ def roster_table(team: str, ctx=None) -> dash_table.DataTable:
         data=df.to_dict("records"),
         columns=column_defs,
         sort_action="native",
+        fixed_rows={"headers": True},
         style_cell={"verticalAlign": "middle", "textAlign": "center", "padding": "0px 6px"},
         style_cell_conditional=_PHOTO_CELL_STYLE,
         markdown_options={"html": True},
@@ -756,7 +757,8 @@ def roster_table(team: str, ctx=None) -> dash_table.DataTable:
 
 
 _TABLE_STYLE = dict(
-    style_table={"overflowX": "auto", "borderRadius": "8px"},
+    style_table={"overflowX": "auto", "overflowY": "auto",
+                 "maxHeight": "420px", "borderRadius": "8px"},
     style_header={
         "backgroundColor": "#0F172A",
         "color": C_MUTED,
@@ -805,6 +807,7 @@ def hitter_table(team: str, ctx=None) -> dash_table.DataTable:
         data=df.to_dict("records"),
         columns=column_defs,
         sort_action="native",
+        fixed_rows={"headers": True},
         style_cell={"verticalAlign": "middle", "textAlign": "center", "padding": "0px 6px"},
         style_cell_conditional=_PHOTO_CELL_STYLE,
         markdown_options={"html": True},
@@ -835,6 +838,7 @@ def sp_table(team: str, ctx=None) -> dash_table.DataTable:
         data=df.to_dict("records"),
         columns=column_defs,
         sort_action="native",
+        fixed_rows={"headers": True},
         style_cell={"verticalAlign": "middle", "textAlign": "center", "padding": "0px 6px"},
         style_cell_conditional=_PHOTO_CELL_STYLE,
         markdown_options={"html": True},
@@ -865,6 +869,7 @@ def rp_table(team: str, ctx=None) -> dash_table.DataTable:
         data=df.to_dict("records"),
         columns=column_defs,
         sort_action="native",
+        fixed_rows={"headers": True},
         style_cell={"verticalAlign": "middle", "textAlign": "center", "padding": "0px 6px"},
         style_cell_conditional=_PHOTO_CELL_STYLE,
         markdown_options={"html": True},

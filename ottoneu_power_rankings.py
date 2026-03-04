@@ -46,6 +46,10 @@ PROJ_SYSTEMS = {
         r"C:\Users\Rachel\Downloads\RegularZipsHitters.csv",
         r"C:\Users\Rachel\Downloads\RegularZipsPitcher.csv",
     ),
+    "Steamer": (
+        r"C:\Users\Rachel\Downloads\SteamerHitter.csv",
+        r"C:\Users\Rachel\Downloads\SteamerPitcher.csv",
+    ),
 }
 
 W            = 140                   # console print / output width

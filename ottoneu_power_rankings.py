@@ -24,15 +24,15 @@ warnings.filterwarnings("ignore")
 SEASON_WEEKS   = 21          # 21-week scoring season
 SEASON_DAYS    = 140         # regular-season game-days (no playoffs)
 SP_STARTS_CAP  = 10 * SEASON_WEEKS   # 210 starts / season
-RP_APPS_CAP    = 400                 # RP innings/appearances cap
+RP_APPS_CAP    = 350                 # RP innings/appearances cap
 IP_PER_START   = 5.25                 # fallback innings per SP outing (used only when GS = 0)
 SCHEDULE_SCALE = 140 / 162           # scale 162-game projections down to 140-game regular season
 MAX_PLAYER_G   = 140                 # hard cap on games any single player can contribute
 
 # ── File paths ────────────────────────────────────────────────────────────────
 # Roster files  – leaderboard exports that contain the Fantasy/team column
-HITTER_ROSTER_FILE  = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (25).csv"
-PITCHER_ROSTER_FILE = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (26).csv"
+HITTER_ROSTER_FILE  = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (30).csv"
+PITCHER_ROSTER_FILE = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (31).csv"
 FIELDING_FILE       = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (29).csv"
 
 # Projection systems – add Steamer/ATC here once you have those files

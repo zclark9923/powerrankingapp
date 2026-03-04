@@ -210,7 +210,7 @@ def rank_color(rank: int, n: int) -> str:
 
 
 _SP_STARTS_CAP = 210
-_RP_APPS_CAP   = 400
+_RP_APPS_CAP   = 350
 _SLOT_G_CAP    = 140
 _SLOT_COUNTS   = {"C": 1, "1B": 1, "2B": 1, "SS": 1, "MIF": 1, "3B": 1, "OF": 5, "Util": 1}
 
@@ -218,7 +218,7 @@ _SLOT_COUNTS   = {"C": 1, "1B": 1, "2B": 1, "SS": 1, "MIF": 1, "3B": 1, "OF": 5,
 def usage_bar(label: str, used: float, cap: float, unit: str = "") -> html.Div:
     """Single labeled progress bar: label — colored fill — used / cap."""
     frac = min(used / cap, 1.0) if cap > 0 else 0.0
-    bar_color = "#22C55E" if frac < 0.80 else ("#F59E0B" if frac < 0.96 else "#EF4444")
+    bar_color = "#EF4444" if frac < 0.50 else ("#F59E0B" if frac < 0.80 else "#22C55E")
     val_text  = f"{used:,.0f} / {cap:,.0f}{' ' + unit if unit else ''}"
     return html.Div([
         html.Span(label, style={"minWidth": "88px", "fontSize": "12px",

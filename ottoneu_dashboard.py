@@ -36,21 +36,6 @@ C_GRID = "#334155"   # chart gridlines
 SLOT_ORDER = ["C", "1B", "2B", "SS", "MIF", "3B", "OF", "Util"]
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-if not XLSX_PATH.is_file():
-    raise FileNotFoundError(
-        f"Workbook not found: {XLSX_PATH}\n"
-        "Run ottoneu_power_rankings.py first to generate it."
-    )
-
-summary  = pd.read_excel(XLSX_PATH, sheet_name="Summary")
-hitters  = pd.read_excel(XLSX_PATH, sheet_name="Hitters")
-sp_data  = pd.read_excel(XLSX_PATH, sheet_name="SP_Detail")
-rp_data  = pd.read_excel(XLSX_PATH, sheet_name="RP_Detail")
-try:
-    roster_data = pd.read_excel(XLSX_PATH, sheet_name="Roster")
-except Exception:
-    roster_data = pd.DataFrame()
-
 # ── Team name display mapping (truncated CSV names → full display names) ──────
 TEAM_NAMES = {
     "Even Baked": "Even Baked Alaska",
@@ -67,79 +52,136 @@ TEAM_NAMES = {
     "Apple Cinn": "Apple Cinnamon Churious",
 }
 
-for _df in (summary, hitters, sp_data, rp_data, roster_data):
-    if "Team" in _df.columns:
-        _df["Team"] = _df["Team"].replace(TEAM_NAMES)
-
-HAS_SALARY_DATA = all(c in summary.columns
-                       for c in ["Total_Salary", "Avg_Age", "Sal_Hit", "Sal_SP", "Sal_RP"])
-
-summary  = summary.sort_values("Total_SPTS", ascending=False).reset_index(drop=True)
-summary["Rank"] = summary.index + 1
-
-teams = summary["Team"].tolist()
-
-# Per-slot SPTS totals for each team (for position radar)
-POS_SLOTS = ["C", "1B", "2B", "SS", "3B", "MIF", "OF"]
-slot_spts = (
-    hitters.groupby(["Team", "Slot"])["SPTS"]
-    .sum()
-    .unstack(fill_value=0)
-    .reindex(columns=POS_SLOTS, fill_value=0)
-)
-slot_league_avg = slot_spts.mean()
-slot_league_max = slot_spts.max().replace(0, 1)  # avoid div-by-zero
-slot_league_min = slot_spts.min()                # floor for min-max scaling
-
-# Pitching radar pre-computation (K, BB avoidance, HR avoidance, SV, HLD)
-# Min-max scale all 5 radar cols so league avg always sits near 50%
-_PIT_MAX = summary[["Pit_K", "Pit_BB", "Pit_HR", "SV", "HLD"]].max().replace(0, 1)
-_PIT_MIN = summary[["Pit_K", "Pit_BB", "Pit_HR", "SV", "HLD"]].min()
-
-# ── Percentile ranks for conditional tile colouring ───────────────────────────
-# pct_rank[col][team] = 0..1 where 1.0 = best in league for that stat
+# ── Stat ranking categories ────────────────────────────────────────────────────
 _HIGHER_BETTER = ["Total_SPTS", "Hit_SPTS", "SP_SPTS", "RP_SPTS",
                   "Hit_wOBA", "Hit_OPS", "Hit_HR", "Hit_SB", "Hit_2B", "Hit_BB",
                   "Pit_K", "SV", "HLD", "Total_IP"]
 _LOWER_BETTER  = ["Pit_BB", "Pit_HR", "Pit_FIP", "Avg_Age"]
 
-_idx = summary.set_index("Team")
-pct_rank: dict = {}
-for _col in _HIGHER_BETTER:
-    if _col in _idx.columns:
-        pct_rank[_col] = _idx[_col].rank(pct=True)
-for _col in _LOWER_BETTER:
-    if _col in _idx.columns:
-        pct_rank[_col] = 1 - _idx[_col].rank(pct=True)
-# Batting average (derived)
-_ba = _idx.apply(lambda r: r["Hit_H"] / r["Hit_AB"] if r["Hit_AB"] > 0 else 0, axis=1)
-pct_rank["BA"] = _ba.rank(pct=True)
 
-# Integer ranks (1 = best in league for that stat)
-int_rank: dict = {}
-for _col in _HIGHER_BETTER:
-    if _col in _idx.columns:
-        int_rank[_col] = _idx[_col].rank(ascending=False, method="min").astype(int)
-for _col in _LOWER_BETTER:
-    if _col in _idx.columns:
-        int_rank[_col] = _idx[_col].rank(ascending=True, method="min").astype(int)
-int_rank["BA"] = _ba.rank(ascending=False, method="min").astype(int)
+POS_SLOTS = ["C", "1B", "2B", "SS", "3B", "MIF", "OF"]
+
+# ── SysCtx: all pre-computed data for one projection system ───────────────────
+class SysCtx:
+    """Bundles a projection system's DataFrames with pre-computed ranking/radar data."""
+
+    def __init__(self, sys_name: str,
+                 raw_summary, raw_hitters, raw_sp, raw_rp, raw_roster):
+        for _df in (raw_summary, raw_hitters, raw_sp, raw_rp, raw_roster):
+            if "Team" in _df.columns:
+                _df["Team"] = _df["Team"].replace(TEAM_NAMES)
+        raw_summary = raw_summary.sort_values("Total_SPTS", ascending=False).reset_index(drop=True)
+        raw_summary["Rank"] = raw_summary.index + 1
+
+        self.sys_name    = sys_name
+        self.summary     = raw_summary
+        self.hitters     = raw_hitters
+        self.sp_data     = raw_sp
+        self.rp_data     = raw_rp
+        self.roster_data = raw_roster
+        self.teams       = raw_summary["Team"].tolist()
+        self.has_salary  = all(c in raw_summary.columns
+                               for c in ["Total_Salary", "Avg_Age", "Sal_Hit", "Sal_SP", "Sal_RP"])
+
+        # Slot SPTS for position radar
+        self.slot_spts = (
+            raw_hitters.groupby(["Team", "Slot"])["SPTS"].sum()
+            .unstack(fill_value=0)
+            .reindex(columns=POS_SLOTS, fill_value=0)
+            if not raw_hitters.empty else pd.DataFrame(columns=POS_SLOTS)
+        )
+        self.slot_league_avg = self.slot_spts.mean()
+        self.slot_league_max = self.slot_spts.max().replace(0, 1)
+        self.slot_league_min = self.slot_spts.min()
+
+        # Percentile ranks (0..1, 1.0 = best in league)
+        _idx = raw_summary.set_index("Team")
+        self.pct_rank: dict = {}
+        for _col in _HIGHER_BETTER:
+            if _col in _idx.columns:
+                self.pct_rank[_col] = _idx[_col].rank(pct=True)
+        for _col in _LOWER_BETTER:
+            if _col in _idx.columns:
+                self.pct_rank[_col] = 1 - _idx[_col].rank(pct=True)
+        _ba = _idx.apply(lambda r: r["Hit_H"] / r["Hit_AB"] if r["Hit_AB"] > 0 else 0, axis=1)
+        self.pct_rank["BA"] = _ba.rank(pct=True)
+
+        # Integer league ranks (1 = best)
+        self.int_rank: dict = {}
+        for _col in _HIGHER_BETTER:
+            if _col in _idx.columns:
+                self.int_rank[_col] = _idx[_col].rank(ascending=False, method="min").astype(int)
+        for _col in _LOWER_BETTER:
+            if _col in _idx.columns:
+                self.int_rank[_col] = _idx[_col].rank(ascending=True, method="min").astype(int)
+        self.int_rank["BA"] = _ba.rank(ascending=False, method="min").astype(int)
 
 
-def tile_rank(col: str, team: str):
-    """Return integer rank 1-N (1=best) for a team on a stat, or None."""
-    series = int_rank.get(col)
+# ── Detect and load all available projection systems from XLSX ─────────────────
+if not XLSX_PATH.is_file():
+    raise FileNotFoundError(
+        f"Workbook not found: {XLSX_PATH}\n"
+        "Run ottoneu_power_rankings.py first to generate it."
+    )
+
+_xl = pd.ExcelFile(XLSX_PATH)
+_AVAIL_SYSTEMS: list = [
+    s[:-len("_Summary")].replace("_", " ")
+    for s in _xl.sheet_names if s.endswith("_Summary")
+]
+if not _AVAIL_SYSTEMS:
+    _AVAIL_SYSTEMS = ["ZiPS DC"]   # fallback if old-format XLSX
+
+
+def _load_sys(display_name: str) -> SysCtx:
+    safe = display_name.replace(" ", "_")
+    def _rd(sheet):
+        try:
+            return pd.read_excel(XLSX_PATH, sheet_name=sheet)
+        except Exception:
+            return pd.DataFrame()
+    return SysCtx(display_name,
+                  _rd(f"{safe}_Summary"), _rd(f"{safe}_Hitters"),
+                  _rd(f"{safe}_SP_Detail"), _rd(f"{safe}_RP_Detail"),
+                  _rd(f"{safe}_Roster"))
+
+
+_ALL_CTX: dict = {s: _load_sys(s) for s in _AVAIL_SYSTEMS}
+_DEFAULT_SYS   = _AVAIL_SYSTEMS[0]
+_DEFAULT_CTX   = _ALL_CTX[_DEFAULT_SYS]
+
+# Module-level aliases → default system (used by static layout builds)
+summary         = _DEFAULT_CTX.summary
+hitters         = _DEFAULT_CTX.hitters
+sp_data         = _DEFAULT_CTX.sp_data
+rp_data         = _DEFAULT_CTX.rp_data
+roster_data     = _DEFAULT_CTX.roster_data
+teams           = _DEFAULT_CTX.teams
+HAS_SALARY_DATA = _DEFAULT_CTX.has_salary
+slot_spts       = _DEFAULT_CTX.slot_spts
+slot_league_avg = _DEFAULT_CTX.slot_league_avg
+slot_league_max = _DEFAULT_CTX.slot_league_max
+slot_league_min = _DEFAULT_CTX.slot_league_min
+
+
+def tile_rank(col: str, team: str, ctx=None):
+    """Return integer league rank 1-N (1=best) for a team on a stat, or None."""
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    series = ctx.int_rank.get(col)
     if series is None:
         return None
     val = series.get(team)
-    if val is None or (hasattr(val, '__class__') and val != val):  # NaN check
+    if val is None or (hasattr(val, "__class__") and val != val):  # NaN check
         return None
     return int(val)
 
 
-def pct_color(col: str, team: str) -> str:
+def pct_color(col: str, team: str, ctx=None) -> str:
     """Green (high/good) → neutral (mid) → red (low/bad) gradient by percentile."""
-    v = float(pct_rank.get(col, pd.Series(dtype=float)).get(team, 0.5))
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    v = float(ctx.pct_rank.get(col, pd.Series(dtype=float)).get(team, 0.5))
     v = max(0.0, min(1.0, v))
     # Anchors: red #EF4444=(239,68,68) → white #E5E7EB=(229,231,235) → green #22C55E=(34,197,94)
     if v <= 0.5:
@@ -266,18 +308,20 @@ def build_scatter_fig(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def build_radar_fig(team: str) -> go.Figure:
+def build_radar_fig(team: str, ctx=None) -> go.Figure:
     """Position-slot strength radar — raw SPTS per slot vs league average."""
-    team_row = slot_spts.loc[team] if team in slot_spts.index else pd.Series(0, index=POS_SLOTS)
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    team_row = ctx.slot_spts.loc[team] if team in ctx.slot_spts.index else pd.Series(0, index=POS_SLOTS)
 
     # OF has 5 slots; divide by 5 to put it on a per-slot basis like every other position
     OF_DIV = {s: (5 if s == "OF" else 1) for s in POS_SLOTS}
 
     vals     = [team_row[s] / OF_DIV[s] for s in POS_SLOTS]
-    avg_vals = [float(slot_league_avg[s]) / OF_DIV[s] for s in POS_SLOTS]
+    avg_vals = [float(ctx.slot_league_avg[s]) / OF_DIV[s] for s in POS_SLOTS]
 
     # Radial axis ceiling: highest per-slot value in league, padded 10%
-    raw_max  = max(float(slot_league_max[s]) / OF_DIV[s] for s in POS_SLOTS)
+    raw_max  = max(float(ctx.slot_league_max[s]) / OF_DIV[s] for s in POS_SLOTS)
     radar_max = max(100, round(raw_max * 1.12 / 25) * 25)
 
     labels = POS_SLOTS
@@ -334,12 +378,14 @@ def build_radar_fig(team: str) -> go.Figure:
     return fig
 
 
-def build_pit_radar_fig(team: str) -> go.Figure:
+def build_pit_radar_fig(team: str, ctx=None) -> go.Figure:
     """Pitching radar — per-axis min-max (0–100) on SPTS-converted values.
     Scoring: IP×5, K×2, BB cost×3, HR cost×13, SV×5, HLD×4.
     BB/HR axes inverted before scaling so outward always = better.
     League avg ring = actual average position on each axis.
     """
+    if ctx is None:
+        ctx = _DEFAULT_CTX
     MULT_IP  = 5.0
     MULT_K   = 2.0
     MULT_BB  = 3.0
@@ -347,16 +393,16 @@ def build_pit_radar_fig(team: str) -> go.Figure:
     MULT_SV  = 5.0
     MULT_HLD = 4.0
 
-    row     = summary[summary["Team"] == team].iloc[0]
-    avg_row = summary.mean(numeric_only=True)
+    row     = ctx.summary[ctx.summary["Team"] == team].iloc[0]
+    avg_row = ctx.summary.mean(numeric_only=True)
 
     # Raw SPTS-unit series across all teams
-    s_ip  = summary["Total_IP"] * MULT_IP
-    s_k   = summary["Pit_K"]    * MULT_K
-    s_bb  = summary["Pit_BB"]   * MULT_BB   # cost — lower is better → invert
-    s_hr  = summary["Pit_HR"]   * MULT_HR   # cost — lower is better → invert
-    s_sv  = summary["SV"]       * MULT_SV
-    s_hld = summary["HLD"]      * MULT_HLD
+    s_ip  = ctx.summary["Total_IP"] * MULT_IP
+    s_k   = ctx.summary["Pit_K"]    * MULT_K
+    s_bb  = ctx.summary["Pit_BB"]   * MULT_BB   # cost — lower is better → invert
+    s_hr  = ctx.summary["Pit_HR"]   * MULT_HR   # cost — lower is better → invert
+    s_sv  = ctx.summary["SV"]       * MULT_SV
+    s_hld = ctx.summary["HLD"]      * MULT_HLD
 
     # Invert cost axes so higher = better on every axis
     s_bb_inv  = s_bb.max()  - s_bb
@@ -452,8 +498,10 @@ def build_pit_radar_fig(team: str) -> go.Figure:
     return fig
 
 
-def build_spts_donut(team: str) -> go.Figure:
-    row = summary[summary["Team"] == team].iloc[0]
+def build_spts_donut(team: str, ctx=None) -> go.Figure:
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    row = ctx.summary[ctx.summary["Team"] == team].iloc[0]
     fig = go.Figure(go.Pie(
         labels=["Hitting", "SP", "RP"],
         values=[row["Hit_SPTS"], row["SP_SPTS"], row["RP_SPTS"]],
@@ -481,15 +529,17 @@ def build_spts_donut(team: str) -> go.Figure:
 
 # ── Roster & Salary figures ────────────────────────────────────────────────
 
-def build_salary_bar_fig() -> go.Figure:
+def build_salary_bar_fig(ctx=None) -> go.Figure:
     """Stacked horizontal salary bar — Hit / SP / RP per team, sorted by rank."""
-    if not HAS_SALARY_DATA:
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    if not ctx.has_salary:
         fig = go.Figure()
         fig.update_layout(paper_bgcolor=C_BG, font_color=C_MUTED,
                           annotations=[dict(text="Re-run ottoneu_power_rankings.py to load salary data",
                                             showarrow=False, font_color=C_MUTED)])
         return fig
-    df = summary.sort_values("Total_SPTS", ascending=True)
+    df = ctx.summary.sort_values("Total_SPTS", ascending=True)
     fig = go.Figure()
     for col, label, color in [
         ("Sal_Hit", "Hitting",    C_HIT),
@@ -522,11 +572,13 @@ def build_salary_bar_fig() -> go.Figure:
     return fig
 
 
-def build_salary_scatter_fig() -> go.Figure:
+def build_salary_scatter_fig(ctx=None) -> go.Figure:
     """Total Salary vs Projected SPTS — one dot per team (value chart)."""
-    if not HAS_SALARY_DATA:
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    if not ctx.has_salary:
         return go.Figure()
-    df = summary.copy()
+    df = ctx.summary.copy()
     df["SPTS_per_$"] = df.apply(
         lambda r: round(r["Total_SPTS"] / r["Total_Salary"], 2)
         if r.get("Total_Salary", 0) > 0 else 0, axis=1
@@ -559,13 +611,15 @@ def build_salary_scatter_fig() -> go.Figure:
     return fig
 
 
-def build_age_bar_fig() -> go.Figure:
+def build_age_bar_fig(ctx=None) -> go.Figure:
     """Average roster age per team, sorted by age."""
-    if not HAS_SALARY_DATA:
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    if not ctx.has_salary:
         return go.Figure()
-    df = summary.sort_values("Avg_Age", ascending=True)
-    league_avg = float(summary["Avg_Age"].mean())
-    colors = [pct_color("Avg_Age", t) for t in df["Team"]]
+    df = ctx.summary.sort_values("Avg_Age", ascending=True)
+    league_avg = float(ctx.summary["Avg_Age"].mean())
+    colors = [pct_color("Avg_Age", t, ctx) for t in df["Team"]]
     fig = go.Figure(go.Bar(
         x=df["Team"], y=df["Avg_Age"],
         marker_color=colors,
@@ -587,11 +641,13 @@ def build_age_bar_fig() -> go.Figure:
     return fig
 
 
-def build_roster_pos_bar(team: str) -> go.Figure:
+def build_roster_pos_bar(team: str, ctx=None) -> go.Figure:
     """Average salary by position/role for a single team."""
-    if roster_data.empty:
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    if ctx.roster_data.empty:
         return go.Figure()
-    df = roster_data[roster_data["Team"] == team].copy()
+    df = ctx.roster_data[ctx.roster_data["Team"] == team].copy()
     if df.empty:
         return go.Figure()
     agg = (
@@ -659,8 +715,10 @@ _PHOTO_CSS = [
 ]
 
 
-def roster_table(team: str) -> dash_table.DataTable:
-    df = roster_data[roster_data["Team"] == team].copy()
+def roster_table(team: str, ctx=None) -> dash_table.DataTable:
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    df = ctx.roster_data[ctx.roster_data["Team"] == team].copy()
     df = df.sort_values("Salary", ascending=False)
     df["SPTS/$"] = df.apply(
         lambda r: round(float(r["SPTS"]) / float(r["Salary"]), 1)
@@ -722,8 +780,10 @@ _TABLE_STYLE = dict(
 )
 
 
-def hitter_table(team: str) -> dash_table.DataTable:
-    df = hitters[hitters["Team"] == team].copy()
+def hitter_table(team: str, ctx=None) -> dash_table.DataTable:
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    df = ctx.hitters[ctx.hitters["Team"] == team].copy()
     df["Slot_order"] = df["Slot"].map(
         {s: i for i, s in enumerate(SLOT_ORDER)}).fillna(99)
     df = df.sort_values(["Slot_order", "SPTS/G"], ascending=[True, False])
@@ -753,8 +813,10 @@ def hitter_table(team: str) -> dash_table.DataTable:
     )
 
 
-def sp_table(team: str) -> dash_table.DataTable:
-    df = sp_data[sp_data["Team"] == team].copy()
+def sp_table(team: str, ctx=None) -> dash_table.DataTable:
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    df = ctx.sp_data[ctx.sp_data["Team"] == team].copy()
     df = df.sort_values("SPTS_used", ascending=False)
     if "MLBAMID" in df.columns:
         df["Photo"] = df["MLBAMID"].apply(_photo_md)
@@ -781,8 +843,10 @@ def sp_table(team: str) -> dash_table.DataTable:
     )
 
 
-def rp_table(team: str) -> dash_table.DataTable:
-    df = rp_data[rp_data["Team"] == team].copy()
+def rp_table(team: str, ctx=None) -> dash_table.DataTable:
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    df = ctx.rp_data[ctx.rp_data["Team"] == team].copy()
     df = df.sort_values("SPTS_used", ascending=False)
     if "MLBAMID" in df.columns:
         df["Photo"] = df["MLBAMID"].apply(_photo_md)
@@ -810,47 +874,49 @@ def rp_table(team: str) -> dash_table.DataTable:
 
 
 # ── Comparison helper ────────────────────────────────────────────────────────
-def _team_comparison_col(team: str) -> html.Div:
+def _team_comparison_col(team: str, ctx=None) -> html.Div:
     """Tiles + both radar charts for one team — used in the comparison tab."""
-    row   = summary[summary["Team"] == team].iloc[0]
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    row   = ctx.summary[ctx.summary["Team"] == team].iloc[0]
     rank  = int(row["Rank"])
-    n     = len(summary)
+    n     = len(ctx.summary)
     r_col = rank_color(rank, n)
     ba    = row["Hit_H"] / row["Hit_AB"] if row["Hit_AB"] > 0 else 0
 
     tiles = html.Div([
         tile_group("Overall", [
             stat_tile("Rank",       f"#{rank}",                   f"of {n} teams",      r_col),
-            stat_tile("Total SPTS", f"{row['Total_SPTS']:,.0f}",  "projected",          pct_color("Total_SPTS", team), rnk=tile_rank("Total_SPTS", team)),
-            stat_tile("Hitting",    f"{row['Hit_SPTS']:,.0f}",    "SPTS",               pct_color("Hit_SPTS",   team), rnk=tile_rank("Hit_SPTS",   team)),
-            stat_tile("Starting P", f"{row['SP_SPTS']:,.0f}",     "SPTS",               pct_color("SP_SPTS",    team), rnk=tile_rank("SP_SPTS",    team)),
-            stat_tile("Relief P",   f"{row['RP_SPTS']:,.0f}",     "SPTS",               pct_color("RP_SPTS",    team), rnk=tile_rank("RP_SPTS",    team)),
+            stat_tile("Total SPTS", f"{row['Total_SPTS']:,.0f}",  "projected",          pct_color("Total_SPTS", team, ctx), rnk=tile_rank("Total_SPTS", team, ctx)),
+            stat_tile("Hitting",    f"{row['Hit_SPTS']:,.0f}",    "SPTS",               pct_color("Hit_SPTS",   team, ctx), rnk=tile_rank("Hit_SPTS",   team, ctx)),
+            stat_tile("Starting P", f"{row['SP_SPTS']:,.0f}",     "SPTS",               pct_color("SP_SPTS",    team, ctx), rnk=tile_rank("SP_SPTS",    team, ctx)),
+            stat_tile("Relief P",   f"{row['RP_SPTS']:,.0f}",     "SPTS",               pct_color("RP_SPTS",    team, ctx), rnk=tile_rank("RP_SPTS",    team, ctx)),
         ]),
         tile_group("Batting", [
-            stat_tile("Avg",        f"{ba:.3f}",                  "H/AB (capped)",      pct_color("BA",         team), rnk=tile_rank("BA",         team)),
-            stat_tile("BB (bat)",   f"{row.get('Hit_BB',   0):,.0f}", "walks",          pct_color("Hit_BB",     team), rnk=tile_rank("Hit_BB",     team)),
-            stat_tile("2B",         f"{row.get('Hit_2B',   0):,.0f}", "doubles",        pct_color("Hit_2B",     team), rnk=tile_rank("Hit_2B",     team)),
-            stat_tile("HR",         f"{row.get('Hit_HR',   0):,.0f}", "hitter HR",      pct_color("Hit_HR",     team), rnk=tile_rank("Hit_HR",     team)),
-            stat_tile("SB",         f"{row.get('Hit_SB',   0):,.0f}", "stolen bases",   pct_color("Hit_SB",     team), rnk=tile_rank("Hit_SB",     team)),
-            stat_tile("OPS",        f"{row.get('Hit_OPS',  0):.3f}", "on-base + slug",  pct_color("Hit_OPS",    team), rnk=tile_rank("Hit_OPS",    team)),
-            stat_tile("wOBA",       f"{row.get('Hit_wOBA', 0):.3f}", "weighted on-base",pct_color("Hit_wOBA",   team), rnk=tile_rank("Hit_wOBA",   team)),
+            stat_tile("Avg",        f"{ba:.3f}",                  "H/AB (capped)",      pct_color("BA",         team, ctx), rnk=tile_rank("BA",         team, ctx)),
+            stat_tile("BB (bat)",   f"{row.get('Hit_BB',   0):,.0f}", "walks",          pct_color("Hit_BB",     team, ctx), rnk=tile_rank("Hit_BB",     team, ctx)),
+            stat_tile("2B",         f"{row.get('Hit_2B',   0):,.0f}", "doubles",        pct_color("Hit_2B",     team, ctx), rnk=tile_rank("Hit_2B",     team, ctx)),
+            stat_tile("HR",         f"{row.get('Hit_HR',   0):,.0f}", "hitter HR",      pct_color("Hit_HR",     team, ctx), rnk=tile_rank("Hit_HR",     team, ctx)),
+            stat_tile("SB",         f"{row.get('Hit_SB',   0):,.0f}", "stolen bases",   pct_color("Hit_SB",     team, ctx), rnk=tile_rank("Hit_SB",     team, ctx)),
+            stat_tile("OPS",        f"{row.get('Hit_OPS',  0):.3f}", "on-base + slug",  pct_color("Hit_OPS",    team, ctx), rnk=tile_rank("Hit_OPS",    team, ctx)),
+            stat_tile("wOBA",       f"{row.get('Hit_wOBA', 0):.3f}", "weighted on-base",pct_color("Hit_wOBA",   team, ctx), rnk=tile_rank("Hit_wOBA",   team, ctx)),
         ]),
         tile_group("Pitching", [
-            stat_tile("Total IP",              f"{row['Total_IP']:,.0f}",    "capped",             pct_color("Total_IP",   team), rnk=tile_rank("Total_IP",  team)),
-            stat_tile("Pitcher Strikeouts",    f"{row.get('Pit_K',   0):,.0f}", "strikeouts",      pct_color("Pit_K",      team), rnk=tile_rank("Pit_K",     team)),
-            stat_tile("Pitcher Walks Allowed", f"{row.get('Pit_BB',  0):,.0f}", "walks allowed",   pct_color("Pit_BB",     team), rnk=tile_rank("Pit_BB",    team)),
-            stat_tile("Pitcher HR Allowed",    f"{row.get('Pit_HR',  0):,.0f}", "HR allowed",      pct_color("Pit_HR",     team), rnk=tile_rank("Pit_HR",    team)),
-            stat_tile("FIP",                   f"{row.get('Pit_FIP', 0):.2f}",  "IP-weighted avg", pct_color("Pit_FIP",    team), rnk=tile_rank("Pit_FIP",   team)),
-            stat_tile("SV / HLD",              f"{row['SV']:.0f} / {row['HLD']:.0f}", "capped",   pct_color("SV",         team), rnk=tile_rank("SV",        team)),
+            stat_tile("Total IP",              f"{row['Total_IP']:,.0f}",    "capped",             pct_color("Total_IP",   team, ctx), rnk=tile_rank("Total_IP",  team, ctx)),
+            stat_tile("Pitcher Strikeouts",    f"{row.get('Pit_K',   0):,.0f}", "strikeouts",      pct_color("Pit_K",      team, ctx), rnk=tile_rank("Pit_K",     team, ctx)),
+            stat_tile("Pitcher Walks Allowed", f"{row.get('Pit_BB',  0):,.0f}", "walks allowed",   pct_color("Pit_BB",     team, ctx), rnk=tile_rank("Pit_BB",    team, ctx)),
+            stat_tile("Pitcher HR Allowed",    f"{row.get('Pit_HR',  0):,.0f}", "HR allowed",      pct_color("Pit_HR",     team, ctx), rnk=tile_rank("Pit_HR",    team, ctx)),
+            stat_tile("FIP",                   f"{row.get('Pit_FIP', 0):.2f}",  "IP-weighted avg", pct_color("Pit_FIP",    team, ctx), rnk=tile_rank("Pit_FIP",   team, ctx)),
+            stat_tile("SV / HLD",              f"{row['SV']:.0f} / {row['HLD']:.0f}", "capped",   pct_color("SV",         team, ctx), rnk=tile_rank("SV",        team, ctx)),
         ]),
     ], style={"marginBottom": "16px"})
 
     radars = html.Div([
-        html.Div(dcc.Graph(figure=build_radar_fig(team),
+        html.Div(dcc.Graph(figure=build_radar_fig(team, ctx),
                            config={"displayModeBar": False}),
                  style={"background": C_CARD, "borderRadius": "12px",
                         "padding": "12px", "marginBottom": "12px"}),
-        html.Div(dcc.Graph(figure=build_pit_radar_fig(team),
+        html.Div(dcc.Graph(figure=build_pit_radar_fig(team, ctx),
                            config={"displayModeBar": False}),
                  style={"background": C_CARD, "borderRadius": "12px",
                         "padding": "12px"}),
@@ -887,8 +953,17 @@ app.layout = html.Div(className="page-wrap", style={
     html.Div([
         html.H1("⚾ Ottoneu 2026 Power Rankings",
                 style={"margin": "0", "fontSize": "24px", "fontWeight": "800"}),
-        html.P("Lineup-constrained projected SPTS  ·  ZiPS",
+        html.P("Lineup-constrained projected SPTS",
                style={"margin": "4px 0 0", "color": C_MUTED, "fontSize": "13px"}),
+        dcc.RadioItems(
+            id="proj-system-radio",
+            options=[{"label": s, "value": s} for s in _AVAIL_SYSTEMS],
+            value=_DEFAULT_SYS,
+            inline=True,
+            style={"marginTop": "10px", "color": C_MUTED, "fontSize": "13px"},
+            inputStyle={"marginRight": "6px"},
+            labelStyle={"marginRight": "20px", "cursor": "pointer"},
+        ),
     ], style={"marginBottom": "24px"}),
 
     dcc.Tabs(id="main-tabs", value="rankings",
@@ -977,11 +1052,13 @@ app.layout = html.Div(className="page-wrap", style={
 
             # League-wide salary & value charts
             html.Div([
-                html.Div(dcc.Graph(figure=build_salary_bar_fig(),
+                html.Div(dcc.Graph(id="salary-bar-fig",
+                                   figure=build_salary_bar_fig(),
                                    config={"displayModeBar": False}),
                          style={"flex": "1", "background": C_CARD,
                                 "borderRadius": "12px", "padding": "12px"}),
-                html.Div(dcc.Graph(figure=build_salary_scatter_fig(),
+                html.Div(dcc.Graph(id="salary-scatter-fig",
+                                   figure=build_salary_scatter_fig(),
                                    config={"displayModeBar": False}),
                          style={"flex": "1", "background": C_CARD,
                                 "borderRadius": "12px", "padding": "12px"}),
@@ -990,7 +1067,8 @@ app.layout = html.Div(className="page-wrap", style={
 
             # Age bar (league-wide)
             html.Div(
-                dcc.Graph(figure=build_age_bar_fig(),
+                dcc.Graph(id="age-bar-fig",
+                          figure=build_age_bar_fig(),
                           config={"displayModeBar": False}),
                 style={"background": C_CARD, "borderRadius": "12px",
                        "padding": "12px", "marginBottom": "28px"},
@@ -1018,51 +1096,54 @@ app.layout = html.Div(className="page-wrap", style={
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
 
-@app.callback(Output("report-card", "children"), Input("team-dropdown", "value"))
-def render_report_card(team: str):
-    row   = summary[summary["Team"] == team].iloc[0]
+@app.callback(Output("report-card", "children"),
+              Input("team-dropdown", "value"),
+              Input("proj-system-radio", "value"))
+def render_report_card(team: str, sys_val: str):
+    ctx   = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+    row   = ctx.summary[ctx.summary["Team"] == team].iloc[0]
     rank  = int(row["Rank"])
-    n     = len(summary)
+    n     = len(ctx.summary)
     r_col = rank_color(rank, n)
     ba    = row["Hit_H"] / row["Hit_AB"] if row["Hit_AB"] > 0 else 0
 
     tiles = html.Div([
         tile_group("Overall", [
             stat_tile("Rank",       f"#{rank}",                   f"of {n} teams",      r_col),
-            stat_tile("Total SPTS", f"{row['Total_SPTS']:,.0f}",  "projected",          pct_color("Total_SPTS", team), rnk=tile_rank("Total_SPTS", team)),
-            stat_tile("Hitting",    f"{row['Hit_SPTS']:,.0f}",    "SPTS",               pct_color("Hit_SPTS",   team), rnk=tile_rank("Hit_SPTS",   team)),
-            stat_tile("Starting P", f"{row['SP_SPTS']:,.0f}",     "SPTS",               pct_color("SP_SPTS",    team), rnk=tile_rank("SP_SPTS",    team)),
-            stat_tile("Relief P",   f"{row['RP_SPTS']:,.0f}",     "SPTS",               pct_color("RP_SPTS",    team), rnk=tile_rank("RP_SPTS",    team)),
+            stat_tile("Total SPTS", f"{row['Total_SPTS']:,.0f}",  "projected",          pct_color("Total_SPTS", team, ctx), rnk=tile_rank("Total_SPTS", team, ctx)),
+            stat_tile("Hitting",    f"{row['Hit_SPTS']:,.0f}",    "SPTS",               pct_color("Hit_SPTS",   team, ctx), rnk=tile_rank("Hit_SPTS",   team, ctx)),
+            stat_tile("Starting P", f"{row['SP_SPTS']:,.0f}",     "SPTS",               pct_color("SP_SPTS",    team, ctx), rnk=tile_rank("SP_SPTS",    team, ctx)),
+            stat_tile("Relief P",   f"{row['RP_SPTS']:,.0f}",     "SPTS",               pct_color("RP_SPTS",    team, ctx), rnk=tile_rank("RP_SPTS",    team, ctx)),
         ]),
         tile_group("Batting", [
-            stat_tile("Avg",        f"{ba:.3f}",                  "H/AB (capped)",      pct_color("BA",         team), rnk=tile_rank("BA",         team)),
-            stat_tile("BB (bat)",   f"{row.get('Hit_BB',   0):,.0f}", "walks",          pct_color("Hit_BB",     team), rnk=tile_rank("Hit_BB",     team)),
-            stat_tile("2B",         f"{row.get('Hit_2B',   0):,.0f}", "doubles",        pct_color("Hit_2B",     team), rnk=tile_rank("Hit_2B",     team)),
-            stat_tile("HR",         f"{row.get('Hit_HR',   0):,.0f}", "hitter HR",      pct_color("Hit_HR",     team), rnk=tile_rank("Hit_HR",     team)),
-            stat_tile("SB",         f"{row.get('Hit_SB',   0):,.0f}", "stolen bases",   pct_color("Hit_SB",     team), rnk=tile_rank("Hit_SB",     team)),
-            stat_tile("OPS",        f"{row.get('Hit_OPS',  0):.3f}", "on-base + slug",  pct_color("Hit_OPS",    team), rnk=tile_rank("Hit_OPS",    team)),
-            stat_tile("wOBA",       f"{row.get('Hit_wOBA', 0):.3f}", "weighted on-base",pct_color("Hit_wOBA",   team), rnk=tile_rank("Hit_wOBA",   team)),
+            stat_tile("Avg",        f"{ba:.3f}",                  "H/AB (capped)",      pct_color("BA",         team, ctx), rnk=tile_rank("BA",         team, ctx)),
+            stat_tile("BB (bat)",   f"{row.get('Hit_BB',   0):,.0f}", "walks",          pct_color("Hit_BB",     team, ctx), rnk=tile_rank("Hit_BB",     team, ctx)),
+            stat_tile("2B",         f"{row.get('Hit_2B',   0):,.0f}", "doubles",        pct_color("Hit_2B",     team, ctx), rnk=tile_rank("Hit_2B",     team, ctx)),
+            stat_tile("HR",         f"{row.get('Hit_HR',   0):,.0f}", "hitter HR",      pct_color("Hit_HR",     team, ctx), rnk=tile_rank("Hit_HR",     team, ctx)),
+            stat_tile("SB",         f"{row.get('Hit_SB',   0):,.0f}", "stolen bases",   pct_color("Hit_SB",     team, ctx), rnk=tile_rank("Hit_SB",     team, ctx)),
+            stat_tile("OPS",        f"{row.get('Hit_OPS',  0):.3f}", "on-base + slug",  pct_color("Hit_OPS",    team, ctx), rnk=tile_rank("Hit_OPS",    team, ctx)),
+            stat_tile("wOBA",       f"{row.get('Hit_wOBA', 0):.3f}", "weighted on-base",pct_color("Hit_wOBA",   team, ctx), rnk=tile_rank("Hit_wOBA",   team, ctx)),
         ]),
         tile_group("Pitching", [
-            stat_tile("Total IP",              f"{row['Total_IP']:,.0f}",    "capped",             pct_color("Total_IP",   team), rnk=tile_rank("Total_IP",  team)),
-            stat_tile("Pitcher Strikeouts",    f"{row.get('Pit_K',   0):,.0f}", "strikeouts",      pct_color("Pit_K",      team), rnk=tile_rank("Pit_K",     team)),
-            stat_tile("Pitcher Walks Allowed", f"{row.get('Pit_BB',  0):,.0f}", "walks allowed",   pct_color("Pit_BB",     team), rnk=tile_rank("Pit_BB",    team)),
-            stat_tile("Pitcher HR Allowed",    f"{row.get('Pit_HR',  0):,.0f}", "HR allowed",      pct_color("Pit_HR",     team), rnk=tile_rank("Pit_HR",    team)),
-            stat_tile("FIP",                   f"{row.get('Pit_FIP', 0):.2f}",  "IP-weighted avg", pct_color("Pit_FIP",    team), rnk=tile_rank("Pit_FIP",   team)),
-            stat_tile("SV / HLD",              f"{row['SV']:.0f} / {row['HLD']:.0f}", "capped",   pct_color("SV",         team), rnk=tile_rank("SV",        team)),
+            stat_tile("Total IP",              f"{row['Total_IP']:,.0f}",    "capped",             pct_color("Total_IP",   team, ctx), rnk=tile_rank("Total_IP",  team, ctx)),
+            stat_tile("Pitcher Strikeouts",    f"{row.get('Pit_K',   0):,.0f}", "strikeouts",      pct_color("Pit_K",      team, ctx), rnk=tile_rank("Pit_K",     team, ctx)),
+            stat_tile("Pitcher Walks Allowed", f"{row.get('Pit_BB',  0):,.0f}", "walks allowed",   pct_color("Pit_BB",     team, ctx), rnk=tile_rank("Pit_BB",    team, ctx)),
+            stat_tile("Pitcher HR Allowed",    f"{row.get('Pit_HR',  0):,.0f}", "HR allowed",      pct_color("Pit_HR",     team, ctx), rnk=tile_rank("Pit_HR",    team, ctx)),
+            stat_tile("FIP",                   f"{row.get('Pit_FIP', 0):.2f}",  "IP-weighted avg", pct_color("Pit_FIP",    team, ctx), rnk=tile_rank("Pit_FIP",   team, ctx)),
+            stat_tile("SV / HLD",              f"{row['SV']:.0f} / {row['HLD']:.0f}", "capped",   pct_color("SV",         team, ctx), rnk=tile_rank("SV",        team, ctx)),
         ]),
     ], style={"marginBottom": "20px"})
 
     charts = html.Div([
-        html.Div(dcc.Graph(figure=build_radar_fig(team),
+        html.Div(dcc.Graph(figure=build_radar_fig(team, ctx),
                            config={"displayModeBar": False}),
                  style={"flex": "1", "background": C_CARD,
                         "borderRadius": "12px", "padding": "12px"}),
-        html.Div(dcc.Graph(figure=build_pit_radar_fig(team),
+        html.Div(dcc.Graph(figure=build_pit_radar_fig(team, ctx),
                            config={"displayModeBar": False}),
                  style={"flex": "1", "background": C_CARD,
                         "borderRadius": "12px", "padding": "12px"}),
-        html.Div(dcc.Graph(figure=build_spts_donut(team),
+        html.Div(dcc.Graph(figure=build_spts_donut(team, ctx),
                            config={"displayModeBar": False}),
                  style={"flex": "1", "background": C_CARD,
                         "borderRadius": "12px", "padding": "12px"}),
@@ -1079,9 +1160,9 @@ def render_report_card(team: str):
                   "padding": "16px", "marginBottom": "16px"})
 
     tables = html.Div([
-        section(f"{team} — Lineup", hitter_table(team)),
-        section(f"{team} — Starting Pitchers", sp_table(team)),
-        section(f"{team} — Relief Pitchers", rp_table(team)),
+        section(f"{team} — Lineup", hitter_table(team, ctx)),
+        section(f"{team} — Starting Pitchers", sp_table(team, ctx)),
+        section(f"{team} — Relief Pitchers", rp_table(team, ctx)),
     ])
 
     return html.Div([
@@ -1108,15 +1189,17 @@ def sync_dropdown_from_bar(click_data):
     Output("compare-output", "children"),
     Input("compare-a", "value"),
     Input("compare-b", "value"),
+    Input("proj-system-radio", "value"),
 )
-def render_comparison(team_a: str, team_b: str):
+def render_comparison(team_a: str, team_b: str, sys_val: str):
+    ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
     return html.Div([
-        _team_comparison_col(team_a),
+        _team_comparison_col(team_a, ctx),
         html.Div(className="compare-divider", style={
             "width": "1px", "background": C_GRID,
             "alignSelf": "stretch", "margin": "0 8px",
         }),
-        _team_comparison_col(team_b),
+        _team_comparison_col(team_b, ctx),
     ], className="flex-row", style={"display": "flex", "gap": "16px", "alignItems": "flex-start"})
 
 
@@ -1124,11 +1207,13 @@ def render_comparison(team_a: str, team_b: str):
 @app.callback(
     Output("roster-team-output", "children"),
     Input("roster-team-dropdown", "value"),
+    Input("proj-system-radio", "value"),
 )
-def render_roster_team(team: str):
+def render_roster_team(team: str, sys_val: str):
     if not team:
         return html.Div()
-    row = summary[summary["Team"] == team].iloc[0]
+    ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+    row = ctx.summary[ctx.summary["Team"] == team].iloc[0]
 
     total_sal   = float(row.get("Total_Salary", 0))
     sal_hit     = float(row.get("Sal_Hit", 0))
@@ -1138,12 +1223,12 @@ def render_roster_team(team: str):
     n_players   = int(row.get("N_Bat", 0)) + int(row.get("N_Pit", 0))
     spts_per_sal = row["Total_SPTS"] / total_sal if total_sal > 0 else 0.0
 
-    if HAS_SALARY_DATA:
+    if ctx.has_salary:
         tiles = html.Div([
             tile_group("Roster Overview", [
                 stat_tile("Total Salary",  f"${total_sal:,.0f}",   f"{n_players} players"),
                 stat_tile("Avg Age",       f"{avg_age:.1f}",        "years",
-                          pct_color("Avg_Age", team), rnk=tile_rank("Avg_Age", team)),
+                          pct_color("Avg_Age", team, ctx), rnk=tile_rank("Avg_Age", team, ctx)),
                 stat_tile("SPTS / $1",     f"{spts_per_sal:.2f}",  "efficiency"),
                 stat_tile("Hitter $",      f"${sal_hit:,.0f}",     "batters",   C_HIT),
                 stat_tile("SP $",          f"${sal_sp:,.0f}",      "starters",  C_SP),
@@ -1158,7 +1243,7 @@ def render_roster_team(team: str):
         )
 
     charts = html.Div([
-        html.Div(dcc.Graph(figure=build_roster_pos_bar(team),
+        html.Div(dcc.Graph(figure=build_roster_pos_bar(team, ctx),
                            config={"displayModeBar": False}),
                  style={"flex": "1", "background": C_CARD,
                         "borderRadius": "12px", "padding": "12px"}),
@@ -1170,7 +1255,7 @@ def render_roster_team(team: str):
             "color": C_MUTED, "textTransform": "uppercase",
             "letterSpacing": "0.07em",
         }),
-        roster_table(team) if not roster_data.empty else
+        roster_table(team, ctx) if not ctx.roster_data.empty else
         html.P("No roster data available.", style={"color": C_MUTED}),
     ], style={"background": C_CARD, "borderRadius": "12px", "padding": "16px"})
 
@@ -1179,6 +1264,33 @@ def render_roster_team(team: str):
                              "fontWeight": "700"}),
         tiles, charts, table_section,
     ])
+
+
+
+
+# ── System-toggle callbacks for static charts ─────────────────────────────────
+
+@app.callback(Output("overview-bar", "figure"), Input("proj-system-radio", "value"))
+def update_overview(sys_val: str):
+    return build_overview_fig(_ALL_CTX.get(sys_val, _DEFAULT_CTX).summary)
+
+
+@app.callback(Output("scatter-fig", "figure"), Input("proj-system-radio", "value"))
+def update_scatter(sys_val: str):
+    return build_scatter_fig(_ALL_CTX.get(sys_val, _DEFAULT_CTX).summary)
+
+
+@app.callback(
+    Output("salary-bar-fig", "figure"),
+    Output("salary-scatter-fig", "figure"),
+    Output("age-bar-fig", "figure"),
+    Input("proj-system-radio", "value"),
+)
+def update_salary_figs(sys_val: str):
+    ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+    return (build_salary_bar_fig(ctx),
+            build_salary_scatter_fig(ctx),
+            build_age_bar_fig(ctx))
 
 
 server = app.server  # exposed for gunicorn: `gunicorn ottoneu_dashboard:server`

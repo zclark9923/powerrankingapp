@@ -34,9 +34,21 @@ MAX_PLAYER_G   = 140                 # hard cap on games any single player can c
 HITTER_ROSTER_FILE  = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (25).csv"
 PITCHER_ROSTER_FILE = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (26).csv"
 FIELDING_FILE       = r"C:\Users\Rachel\Downloads\fangraphs-leaderboards (29).csv"
-# Projection files – ZiPS/Steamer exports that contain the stat projections
-HITTER_PROJ_FILE    = r"C:\Users\Rachel\Downloads\fangraphs-leaderboard-projections (8).csv"
-PITCHER_PROJ_FILE   = r"C:\Users\Rachel\Downloads\fangraphs-leaderboard-projections (9).csv"
+
+# Projection systems – add Steamer/ATC here once you have those files
+# Format: "Display Name": (hitter_csv_path, pitcher_csv_path)
+PROJ_SYSTEMS = {
+    "ZiPS DC": (
+        r"C:\Users\Rachel\Downloads\fangraphs-leaderboard-projections (8).csv",
+        r"C:\Users\Rachel\Downloads\fangraphs-leaderboard-projections (9).csv",
+    ),
+    "ZiPS": (
+        r"C:\Users\Rachel\Downloads\RegularZipsHitters.csv",
+        r"C:\Users\Rachel\Downloads\RegularZipsPitcher.csv",
+    ),
+}
+
+W            = 140                   # console print / output width
 OUT_PATH     = Path(r"C:\Users\Rachel\Desktop\Scripts\ottoneu_power_rankings.csv")
 OUT_XLSX     = OUT_PATH.with_suffix(".xlsx")
 
@@ -283,10 +295,9 @@ def constrained_pitcher_spts(team_pit: pd.DataFrame) -> tuple:
 # Step 1 – Load roster (team assignments) + projections, then merge
 # ─────────────────────────────────────────────────────────────────────────────
 for label, path in (
-    ("Hitter roster",      HITTER_ROSTER_FILE),
-    ("Pitcher roster",     PITCHER_ROSTER_FILE),
-    ("Hitter projections", HITTER_PROJ_FILE),
-    ("Pitcher projections",PITCHER_PROJ_FILE),
+    ("Hitter roster",  HITTER_ROSTER_FILE),
+    ("Pitcher roster", PITCHER_ROSTER_FILE),
+    ("Fielding file",  FIELDING_FILE),
 ):
     if not Path(path).is_file():
         raise FileNotFoundError(f"{label} file not found: {path}")
@@ -320,72 +331,6 @@ for _rf in (hit_roster_full, pit_roster_full):
 hit_roster_ids = hit_roster_full[["PlayerId", "Team", "Salary"]].copy()
 pit_roster_ids  = pit_roster_full[["PlayerId", "Team", "Salary"]].copy()
 
-print("Loading projection files…")
-hit_proj = pd.read_csv(HITTER_PROJ_FILE)
-pit_proj  = pd.read_csv(PITCHER_PROJ_FILE)
-
-if "PlayerId" not in hit_proj.columns or "PlayerId" not in pit_proj.columns:
-    raise KeyError(
-        "Projection CSVs must contain a 'PlayerId' column to merge with roster data. "
-        f"Hitter proj cols: {list(hit_proj.columns)[:10]}  "
-        f"Pitcher proj cols: {list(pit_proj.columns)[:10]}"
-    )
-
-hit_proj["PlayerId"] = hit_proj["PlayerId"].astype(str).str.strip()
-pit_proj["PlayerId"]  = pit_proj["PlayerId"].astype(str).str.strip()
-
-# Drop the MLB-team column from projections so it doesn't collide with the
-# fantasy Team column coming from the roster merge
-hit_proj = hit_proj.drop(columns=["Team"], errors="ignore")
-pit_proj  = pit_proj.drop(columns=["Team"], errors="ignore")
-
-# ── Inner-join frames: projection-matched players only (used for SPTS calc) ─
-hit_df = hit_proj.merge(hit_roster_ids, on="PlayerId", how="inner")
-pit_df  = pit_proj.merge(pit_roster_ids,  on="PlayerId", how="inner")
-
-print(f"  -> {len(hit_df):,} rostered hitters matched to projections.")
-print(f"  -> {len(pit_df):,} rostered pitchers matched to projections.")
-
-# ── Full roster frames: ALL rostered players (left join — zero SPTS if no projection) ─
-_HIT_PROJ_COLS = [c for c in ("PlayerId", "SPTS", "SPTS/G", "AB", "H", "2B", "BB",
-                               "HR", "SB", "wOBA", "OPS") if c in hit_proj.columns]
-_PIT_PROJ_COLS = [c for c in ("PlayerId", "SPTS", "IP", "SV", "HLD", "GS",
-                               "SO", "BB", "HR", "FIP") if c in pit_proj.columns]
-hit_full = hit_roster_full.merge(hit_proj[_HIT_PROJ_COLS], on="PlayerId", how="left")
-pit_full = pit_roster_full.merge(pit_proj[_PIT_PROJ_COLS], on="PlayerId", how="left")
-
-print(f"  -> {len(hit_full):,} total rostered hitters (incl. no-projection players).")
-print(f"  -> {len(pit_full):,} total rostered pitchers (incl. no-projection players).")
-
-for col in ("SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"):
-    if col in hit_df.columns:
-        hit_df[col] = pd.to_numeric(hit_df[col], errors="coerce").fillna(0)
-    else:
-        hit_df[col] = 0.0
-    hit_full[col] = pd.to_numeric(hit_full.get(col, 0), errors="coerce").fillna(0)
-
-for col in ("SPTS", "IP", "SV", "HLD", "GS", "SO", "BB", "HR", "FIP"):
-    if col in pit_df.columns:
-        pit_df[col] = pd.to_numeric(pit_df[col], errors="coerce").fillna(0)
-    else:
-        pit_df[col] = 0.0
-        if col == "GS":
-            print(f"  !! 'GS' column not found in pitcher projections - IP/start will default to {IP_PER_START}.")
-            print(f"     Columns found: {list(pit_df.columns)}")
-    pit_full[col] = pd.to_numeric(pit_full.get(col, 0), errors="coerce").fillna(0)
-
-# Scale all cumulative (season-total) stats from a 162-game season down to the
-# 140-game regular season.  Per-game/per-inning rate columns (SPTS/G, FIP, wOBA,
-# OPS) are NOT scaled — they are already rate stats and remain unchanged.
-_HIT_SCALE_COLS = ["SPTS", "AB", "H", "2B", "BB", "HR", "SB"]
-_PIT_SCALE_COLS = ["SPTS", "IP", "GS", "SV", "HLD", "SO", "BB", "HR"]
-for _col in _HIT_SCALE_COLS:
-    for _df in (hit_df, hit_full):
-        _df[_col] = _df[_col] * SCHEDULE_SCALE
-for _col in _PIT_SCALE_COLS:
-    for _df in (pit_df, pit_full):
-        _df[_col] = _df[_col] * SCHEDULE_SCALE
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 2 – Fetch position data via MLB Stats API (uses MLBAMID, free/no-auth)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -408,16 +353,9 @@ MLB_POS_MAP = {
 }
 POS_FALLBACK = "OF"  # default for unknown hitters
 
-if "MLBAMID" not in hit_df.columns:
-    raise KeyError(
-        "'MLBAMID' column not found in hitter projections CSV. "
-        "Make sure the FanGraphs projection export includes the MLBAM ID field."
-        f"\n  Columns found: {list(hit_df.columns)}"
-    )
-
 # Collect MLBAMIDs from ALL rostered players (roster files always have MLBAMID)
-hit_mlbam_ids = hit_full["MLBAMID"].dropna().astype(int).unique().tolist()
-pit_mlbam_ids = pit_full["MLBAMID"].dropna().astype(int).unique().tolist()
+hit_mlbam_ids = hit_roster_full["MLBAMID"].dropna().astype(int).unique().tolist()
+pit_mlbam_ids = pit_roster_full["MLBAMID"].dropna().astype(int).unique().tolist()
 all_mlbam_ids = list(set(hit_mlbam_ids + pit_mlbam_ids))
 pos_by_mlbam: dict = {}
 age_by_mlbam: dict = {}
@@ -489,323 +427,379 @@ def _apply_pos(df, fallback=POS_FALLBACK):
         lambda mid: age_by_mlbam.get(int(mid)) if pd.notna(mid) else None
     )
 
-_apply_pos(hit_df)
-_apply_pos(hit_full)
-
-# Build name→MLBAMID lookup from all rostered players (used for headshots in Excel sheets)
-for _src in (hit_full, pit_full):
+# Build name->MLBAMID lookup from all rostered players (used for headshots in Excel sheets)
+for _src in (hit_roster_full, pit_roster_full):
     for _, _r in _src[["Name", "MLBAMID"]].iterrows():
         if pd.notna(_r["MLBAMID"]):
             _name_to_mlbam[_r["Name"]] = int(_r["MLBAMID"])
 
-# Drop pitchers that leaked into the hitter batting-leaderboard CSV.
-# The MLB API returns Pos="P" for pure pitchers; they will be captured by the
-# pitcher roster CSV and pitcher loop — counting them here would double-count
-# salary and create duplicate roster rows.
-hit_df   = hit_df[hit_df["Pos"] != "P"].copy()
-hit_full = hit_full[hit_full["Pos"] != "P"].copy()
-print(f"  -> After removing pitchers from hitter frames: {len(hit_df):,} matched, {len(hit_full):,} total.")
-
-# Pitchers: age only (no position lookup needed for pitching logic)
-for _pf in (pit_df, pit_full):
-    _pf["MLBAMID"] = pd.to_numeric(_pf["MLBAMID"], errors="coerce")
-    _pf["Age"] = _pf["MLBAMID"].apply(
-        lambda mid: age_by_mlbam.get(int(mid)) if pd.notna(mid) else None
-    )
-
-# Mirror the is_rp logic from constrained_pitcher_spts for the roster sheet
-# For pit_full: prefer projection stats; fall back to ROSTER CSV stats for
-# unmatched players (IP=0 from fillna would wrongly tag every stashed SP as RP)
-for _pf in (pit_df, pit_full):
-    if "Ros_IP" in _pf.columns:
-        # Use projection IP where available, otherwise use roster-file IP
-        eff_ip  = _pf["IP"].where(_pf["IP"] > 0, _pf["Ros_IP"])
-        eff_sv  = _pf["SV"].where(_pf["SV"] > 0, _pf["Ros_SV"])
-        eff_hld = _pf["HLD"].where(_pf["HLD"] > 0, _pf["Ros_HLD"])
-    else:
-        eff_ip, eff_sv, eff_hld = _pf["IP"], _pf["SV"], _pf["HLD"]
-    _is_rp = (eff_sv > 2) | (eff_hld > 5) | (eff_ip < 70)
-    _pf["Role"] = _is_rp.map({True: "RP", False: "SP"})
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3 – Per-team constrained SPTS
+# run_projection_system: full pipeline for one projection system
+# Uses module-level roster + position data (system-agnostic)
 # ─────────────────────────────────────────────────────────────────────────────
-teams = sorted(hit_df["Team"].unique())
-results, team_lineups, team_pitching = [], {}, {}
-roster_records: list = []
+def run_projection_system(sys_name: str, hit_proj_file: str, pit_proj_file: str) -> dict:
+    """
+    Load projections for one system, merge with rosters, optimise lineups,
+    and return a dict of result DataFrames.
+    Uses module-level: hit_roster_full, pit_roster_full, hit_roster_ids,
+    pit_roster_ids, pos_by_playerid, pos_by_mlbam, age_by_mlbam, _name_to_mlbam.
+    """
+    print(f"\n  [{sys_name}]  Loading projections …")
+    for _lbl, _pth in (("Hitter projections", hit_proj_file),
+                        ("Pitcher projections", pit_proj_file)):
+        if not Path(_pth).is_file():
+            raise FileNotFoundError(f"[{sys_name}] {_lbl} not found: {_pth}")
 
-print(f"\nOptimising lineups for {len(teams)} teams…")
+    hit_proj = pd.read_csv(hit_proj_file)
+    pit_proj  = pd.read_csv(pit_proj_file)
 
-for team in teams:
-    roster  = hit_df[hit_df["Team"] == team][["Name", "Pos", "SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"]].copy()
-    hit_spts, hit_ab, hit_h, hit_2b, hit_bb, hit_hr, hit_sb, hit_woba, hit_ops, lineup = optimal_lineup_spts(roster)
-    team_lineups[team] = lineup
+    if "PlayerId" not in hit_proj.columns or "PlayerId" not in pit_proj.columns:
+        raise KeyError(
+            "Projection CSVs must contain a 'PlayerId' column to merge with roster data. "
+            f"Hitter proj cols: {list(hit_proj.columns)[:10]}  "
+            f"Pitcher proj cols: {list(pit_proj.columns)[:10]}"
+        )
 
-    pit_roster = pit_df[pit_df["Team"] == team].copy()
-    sp_spts, rp_spts, sv_constrained, hld_constrained, pit_k, pit_bb, pit_hr, pit_fip, sp_det, rp_det = constrained_pitcher_spts(pit_roster)
-    team_pitching[team] = (sp_det, rp_det)
+    hit_proj["PlayerId"] = hit_proj["PlayerId"].astype(str).str.strip()
+    pit_proj["PlayerId"]  = pit_proj["PlayerId"].astype(str).str.strip()
 
-    # Used SPTS lookup keyed by player name — used for roster sheet
-    # Hitters: sum across all slots a player appears in
-    used_spts: dict = {}
-    for lrow in lineup:
-        used_spts[lrow["Name"]] = used_spts.get(lrow["Name"], 0.0) + lrow["SPTS"]
-    for prow in sp_det:
-        used_spts[prow["Name"]] = used_spts.get(prow["Name"], 0.0) + prow["SPTS_used"]
-    for prow in rp_det:
-        used_spts[prow["Name"]] = used_spts.get(prow["Name"], 0.0) + prow["SPTS_used"]
+    # Drop the MLB-team column from projections so it doesn't collide with the
+    # fantasy Team column coming from the roster merge
+    hit_proj = hit_proj.drop(columns=["Team"], errors="ignore")
+    pit_proj  = pit_proj.drop(columns=["Team"], errors="ignore")
 
-    team_hit  = hit_df[hit_df["Team"] == team]       # projection-matched (SPTS calc)
-    team_pit  = pit_df[pit_df["Team"] == team]
-    team_hit_full = hit_full[hit_full["Team"] == team]  # all contracted players
-    team_pit_full = pit_full[pit_full["Team"] == team]
+    # ── Inner-join frames: projection-matched players only (used for SPTS calc) ─
+    hit_df = hit_proj.merge(hit_roster_ids, on="PlayerId", how="inner")
+    pit_df  = pit_proj.merge(pit_roster_ids,  on="PlayerId", how="inner")
 
-    # Identify true two-way players: must have a meaningful projection in BOTH
-    # the hitter AND pitcher projection file. Using projection-file PlayerIds
-    # prevents pitchers with 1 PA from being flagged as two-way via the
-    # roster-file overlap.
-    _hit_proj_pids = set(hit_proj["PlayerId"].astype(str))
-    _pit_proj_pids  = set(pit_proj["PlayerId"].astype(str))
-    _twoway_proj    = _hit_proj_pids & _pit_proj_pids
-    hit_pids        = set(team_hit_full["PlayerId"].astype(str))
-    pit_pids        = set(team_pit_full["PlayerId"].astype(str))
-    twoway_pids     = (hit_pids & pit_pids) & _twoway_proj
-    pit_sal_df      = team_pit_full[~team_pit_full["PlayerId"].astype(str).isin(twoway_pids)]
+    print(f"  -> {len(hit_df):,} rostered hitters matched to projections.")
+    print(f"  -> {len(pit_df):,} rostered pitchers matched to projections.")
 
-    # Salary & age aggregations (all rostered players, deduplicated)
-    # Compute SP/RP role inline from best available stats (projection > roster CSV)
-    def _pit_role(p):
-        _ip  = p.get("IP",  0) or p.get("Ros_IP",  0)
-        _sv  = p.get("SV",  0) or p.get("Ros_SV",  0)
-        _hld = p.get("HLD", 0) or p.get("Ros_HLD", 0)
-        return "RP" if (_sv > 2 or _hld > 5 or _ip < 70) else "SP"
+    # ── Full roster frames: ALL rostered players (left join — zero SPTS if no projection) ─
+    _HIT_PROJ_COLS = [c for c in ("PlayerId", "SPTS", "SPTS/G", "AB", "H", "2B", "BB",
+                                   "HR", "SB", "wOBA", "OPS") if c in hit_proj.columns]
+    _PIT_PROJ_COLS = [c for c in ("PlayerId", "SPTS", "IP", "SV", "HLD", "GS",
+                                   "SO", "BB", "HR", "FIP") if c in pit_proj.columns]
+    hit_full = hit_roster_full.merge(hit_proj[_HIT_PROJ_COLS], on="PlayerId", how="left")
+    pit_full = pit_roster_full.merge(pit_proj[_PIT_PROJ_COLS], on="PlayerId", how="left")
 
-    sal_hit  = float(team_hit_full["Salary"].sum())
-    sal_sp   = sum(float(p.get("Salary", 0)) for _, p in pit_sal_df.iterrows()
-                   if _pit_role(p) == "SP")
-    sal_rp   = sum(float(p.get("Salary", 0)) for _, p in pit_sal_df.iterrows()
-                   if _pit_role(p) == "RP")
-    age_hit  = team_hit_full[["PlayerId", "Age"]].drop_duplicates("PlayerId")
-    age_pit  = pit_sal_df[["PlayerId", "Age"]].drop_duplicates("PlayerId")
-    all_ages = pd.concat([age_hit["Age"], age_pit["Age"]]).dropna()
-    avg_age  = round(float(all_ages.mean()), 1) if len(all_ages) > 0 else 0.0
+    print(f"  -> {len(hit_full):,} total rostered hitters (incl. no-projection players).")
+    print(f"  -> {len(pit_full):,} total rostered pitchers (incl. no-projection players).")
 
-    # Collect per-player rows for the Roster sheet (all contracted players)
-    # Pos: DH → Util (DH-only hitters fill the Util slot in Ottoneu)
-    # Role: H / TWP for hitters; SP / RP computed inline for pitchers
-    # SPTS: constrained used SPTS (0 if not in lineup / no projection)
-    for _, p in team_hit_full.iterrows():
-        pid  = str(p.get("PlayerId", ""))
-        role = "TWP" if pid in twoway_pids else "H"
-        raw_pos = p.get("Pos", "?")
-        display_pos = "Util" if raw_pos == "DH" else raw_pos
-        _mid = p.get("MLBAMID")
-        _mid_int = int(_mid) if pd.notna(_mid) else None
-        roster_records.append({
-            "Team":    team,  "Name": p["Name"],
-            "Role":    role,  "Pos":  display_pos,
-            "Salary":  p.get("Salary", 0),
-            "Age":     p.get("Age"),
-            "MLBAMID": _mid_int,
-            "SPTS":    round(used_spts.get(p["Name"], 0.0), 1),
-        })
-    for _, p in team_pit_full.iterrows():
-        if str(p.get("PlayerId", "")) in twoway_pids:
-            continue  # salary already recorded on hitting side
-        # Compute SP/RP inline using best available stats (proj > roster CSV)
-        _ip  = p.get("IP",  0) or p.get("Ros_IP",  0)
-        _sv  = p.get("SV",  0) or p.get("Ros_SV",  0)
-        _hld = p.get("HLD", 0) or p.get("Ros_HLD", 0)
-        role = "RP" if (_sv > 2 or _hld > 5 or _ip < 70) else "SP"
-        _mid = p.get("MLBAMID")
-        _mid_int = int(_mid) if pd.notna(_mid) else None
-        roster_records.append({
-            "Team":    team,  "Name": p["Name"],
-            "Role":    role,  "Pos":  role,
-            "Salary":  p.get("Salary", 0),
-            "Age":     p.get("Age"),
-            "MLBAMID": _mid_int,
-            "SPTS":    round(used_spts.get(p["Name"], 0.0), 1),
-        })
+    for col in ("SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"):
+        if col in hit_df.columns:
+            hit_df[col] = pd.to_numeric(hit_df[col], errors="coerce").fillna(0)
+        else:
+            hit_df[col] = 0.0
+        hit_full[col] = pd.to_numeric(hit_full.get(col, 0), errors="coerce").fillna(0)
 
-    raw_hit = team_hit["SPTS"].sum()
-    raw_pit = team_pit["SPTS"].sum()
+    for col in ("SPTS", "IP", "SV", "HLD", "GS", "SO", "BB", "HR", "FIP"):
+        if col in pit_df.columns:
+            pit_df[col] = pd.to_numeric(pit_df[col], errors="coerce").fillna(0)
+        else:
+            pit_df[col] = 0.0
+            if col == "GS":
+                print(f"  !! 'GS' column not found in pitcher projections - IP/start will default to {IP_PER_START}.")
+                print(f"     Columns found: {list(pit_df.columns)}")
+        pit_full[col] = pd.to_numeric(pit_full.get(col, 0), errors="coerce").fillna(0)
 
-    sp_ip_used = sum(p["IP_used"] for p in sp_det)
-    rp_ip_used = sum(p["IP_used"] for p in rp_det)
+    # Scale all cumulative (season-total) stats from a 162-game season down to the
+    # 140-game regular season.  Per-game/per-inning rate columns (SPTS/G, FIP, wOBA,
+    # OPS) are NOT scaled — they are already rate stats and remain unchanged.
+    _HIT_SCALE_COLS = ["SPTS", "AB", "H", "2B", "BB", "HR", "SB"]
+    _PIT_SCALE_COLS = ["SPTS", "IP", "GS", "SV", "HLD", "SO", "BB", "HR"]
+    for _col in _HIT_SCALE_COLS:
+        for _df in (hit_df, hit_full):
+            _df[_col] = _df[_col] * SCHEDULE_SCALE
+    for _col in _PIT_SCALE_COLS:
+        for _df in (pit_df, pit_full):
+            _df[_col] = _df[_col] * SCHEDULE_SCALE
 
-    results.append({
-        "Team":       team,
-        "Hit_SPTS":   round(hit_spts, 1),
-        "SP_SPTS":    round(sp_spts, 1),
-        "RP_SPTS":    round(rp_spts, 1),
-        "Pit_SPTS":   round(sp_spts + rp_spts, 1),
-        "Total_SPTS": round(hit_spts + sp_spts + rp_spts, 1),
-        "Hit_AB":     round(hit_ab, 1),
-        "Hit_H":      round(hit_h, 1),
-        "Hit_2B":     round(hit_2b, 1),
-        "Hit_BB":     round(hit_bb, 1),
-        "Hit_HR":     round(hit_hr, 1),
-        "Hit_SB":     round(hit_sb, 1),
-        "Hit_wOBA":   round(hit_woba, 3),
-        "Hit_OPS":    round(hit_ops, 3),
-        "Pit_IP":     round(sp_ip_used + rp_ip_used, 1),
-        "SV":         sv_constrained,
-        "HLD":        hld_constrained,
-        "Pit_K":      pit_k,
-        "Pit_BB":     pit_bb,
-        "Pit_HR":     pit_hr,
-        "Pit_FIP":    pit_fip,
-        "SP_IP":      round(sp_ip_used, 1),
-        "RP_IP":      round(rp_ip_used, 1),
-        "Total_IP":   round(sp_ip_used + rp_ip_used, 1),
-        "Raw_Hit":    round(raw_hit, 1),
-        "Raw_Pit":    round(raw_pit, 1),
-        "Raw_Total":  round(raw_hit + raw_pit, 1),
-        "N_Bat":      len(team_hit_full),
-        "N_Pit":      len(team_pit_full),
-        "Total_Salary": round(sal_hit + sal_sp + sal_rp, 0),
-        "Sal_Hit":      round(sal_hit, 0),
-        "Sal_SP":       round(sal_sp, 0),
-        "Sal_RP":       round(sal_rp, 0),
-        "Avg_Age":      avg_age,
-    })
+    # Apply multi-position eligibility (fielding CSV first, MLB API fallback)
+    _apply_pos(hit_df)
+    _apply_pos(hit_full)
 
-roster_df = pd.DataFrame(roster_records)
+    # Drop pitchers that leaked into the hitter batting-leaderboard CSV
+    hit_df   = hit_df[hit_df["Pos"] != "P"].copy()
+    hit_full = hit_full[hit_full["Pos"] != "P"].copy()
+    print(f"  -> After removing pitchers from hitter frames: {len(hit_df):,} matched, {len(hit_full):,} total.")
 
-rankings = (pd.DataFrame(results)
-              .sort_values("Total_SPTS", ascending=False)
-              .reset_index(drop=True))
-rankings.index += 1
+    # Pitchers: age only
+    for _pf in (pit_df, pit_full):
+        _pf["MLBAMID"] = pd.to_numeric(_pf["MLBAMID"], errors="coerce")
+        _pf["Age"] = _pf["MLBAMID"].apply(
+            lambda mid: age_by_mlbam.get(int(mid)) if pd.notna(mid) else None
+        )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 4 – Print power rankings table
-# ─────────────────────────────────────────────────────────────────────────────
-W = 140
-print("\n" + "=" * W)
-print(f"{'OTTONEU 2026 POWER RANKINGS  --  Lineup-Constrained  (ZIPS)':^{W}}")
-print("=" * W)
-print(f"{'Rank':<5} {'Team':<14} {'Hit SPTS':>9} {'SP SPTS':>8} {'RP SPTS':>8} "
-      f"{'TOTAL':>9}  {'Hit AB':>8} {'Hit H':>8} {'Pit IP':>8} {'SV':>6} {'HLD':>6} "
-      f"{'SP IP':>7} {'RP IP':>7} {'Tot IP':>7}")
-print("-" * W)
-for rank, row in rankings.iterrows():
-    print(
-        f"{rank:<5} {row['Team']:<14} {row['Hit_SPTS']:>9,.1f} "
-        f"{row['SP_SPTS']:>8,.1f} {row['RP_SPTS']:>8,.1f} "
-        f"{row['Total_SPTS']:>9,.1f}  "
-        f"{row['Hit_AB']:>8,.1f} {row['Hit_H']:>8,.1f} {row['Pit_IP']:>8,.1f} "
-        f"{row['SV']:>6,.1f} {row['HLD']:>6,.1f} "
-        f"{row['SP_IP']:>7,.1f} {row['RP_IP']:>7,.1f} {row['Total_IP']:>7,.1f}"
-    )
-print("=" * W)
+    # Classify each pitcher as SP or RP (projection stats > roster CSV stats)
+    for _pf in (pit_df, pit_full):
+        if "Ros_IP" in _pf.columns:
+            _eff_ip  = _pf["IP"].where(_pf["IP"]  > 0, _pf["Ros_IP"])
+            _eff_sv  = _pf["SV"].where(_pf["SV"]  > 0, _pf["Ros_SV"])
+            _eff_hld = _pf["HLD"].where(_pf["HLD"] > 0, _pf["Ros_HLD"])
+        else:
+            _eff_ip, _eff_sv, _eff_hld = _pf["IP"], _pf["SV"], _pf["HLD"]
+        _pf["Role"] = (((_eff_sv > 2) | (_eff_hld > 5) | (_eff_ip < 70))
+                        .map({True: "RP", False: "SP"}))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 5 – Lineup + pitching detail per team
-# ─────────────────────────────────────────────────────────────────────────────
-print("=" * W)
-print("OPTIMAL LINEUP & PITCHING DETAIL BY TEAM")
-print("=" * W)
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Step 3 – Per-team constrained SPTS
+    # ─────────────────────────────────────────────────────────────────────────────
+    teams = sorted(hit_df["Team"].unique())
+    results, team_lineups, team_pitching = [], {}, {}
+    roster_records: list = []
 
-for rank, row in rankings.iterrows():
-    team = row["Team"]
-    print(f"\n{'--'} #{rank}  {team}  "
-          f"(Hit: {row['Hit_SPTS']:,.1f} | SP: {row['SP_SPTS']:,.1f} | "
-          f"RP: {row['RP_SPTS']:,.1f} | Total: {row['Total_SPTS']:,.1f})")
+    print(f"\nOptimising lineups for {len(teams)} teams…")
 
-    lineup = team_lineups[team]
-    if lineup:
-        SLOT_PRINT_ORDER = ["C", "1B", "2B", "SS", "MIF", "3B", "OF", "Util"]
-        slot_order_idx   = {s: i for i, s in enumerate(SLOT_PRINT_ORDER)}
-        lineup_sorted    = sorted(lineup, key=lambda x: (slot_order_idx.get(x["Slot"], 99), -x["SPTS/G"]))
-        print(f"  {'SLOT':<6} {'NAME':<28} {'POS':<5} {'G_proj':>6} {'G_used':>6} {'SPTS/G':>7} {'SPTS':>8}")
-        print(f"  {'-'*6} {'-'*28} {'-'*5} {'-'*6} {'-'*6} {'-'*7} {'-'*8}")
-        cur_slot = None
-        for p in lineup_sorted:
-            slot_label = p["Slot"] if p["Slot"] != cur_slot else "  +>"
-            cur_slot   = p["Slot"]
-            print(f"  {slot_label:<6} {p['Name']:<28} {p['Pos']:<5} "
-                  f"{p['G_proj']:>6} {p['G_used']:>6.1f} "
-                  f"{p['SPTS/G']:>7.2f} {p['SPTS']:>8.1f}")
+    for team in teams:
+        roster  = hit_df[hit_df["Team"] == team][["Name", "Pos", "SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"]].copy()
+        hit_spts, hit_ab, hit_h, hit_2b, hit_bb, hit_hr, hit_sb, hit_woba, hit_ops, lineup = optimal_lineup_spts(roster)
+        team_lineups[team] = lineup
 
-    sp_det, rp_det = team_pitching[team]
-    if sp_det:
-        print(f"\n  Starting Pitchers  (cap: {SP_STARTS_CAP} starts)")
-        print(f"  {'NAME':<28} {'GS_proj':>8} {'GS_used':>8} {'IP/GS':>7} {'IP_used':>8} {'SPTS_proj':>10} {'SPTS_used':>10}")
-        print(f"  {'-'*28} {'-'*8} {'-'*8} {'-'*7} {'-'*8} {'-'*10} {'-'*10}")
-        for p in sp_det:
-            print(f"  {p['Name']:<28} {p['Proj_Starts']:>8.1f} {p['Used_Starts']:>8.1f} "
-                  f"{p['IP_per_GS']:>7.2f} {p['IP_used']:>8.1f} {p['SPTS_proj']:>10.1f} {p['SPTS_used']:>10.1f}")
+        pit_roster = pit_df[pit_df["Team"] == team].copy()
+        sp_spts, rp_spts, sv_constrained, hld_constrained, pit_k, pit_bb, pit_hr, pit_fip, sp_det, rp_det = constrained_pitcher_spts(pit_roster)
+        team_pitching[team] = (sp_det, rp_det)
 
-    if rp_det:
-        print(f"\n  Relief Pitchers  (cap: {RP_APPS_CAP} IP)")
-        print(f"  {'NAME':<28} {'App_proj':>8} {'App_used':>8} {'IP_used':>8} {'SPTS_proj':>10} {'SPTS_used':>10} {'SV_proj':>8} {'SV_used':>8} {'HLD_proj':>9} {'HLD_used':>9}")
-        print(f"  {'-'*28} {'-'*8} {'-'*8} {'-'*8} {'-'*10} {'-'*10} {'-'*8} {'-'*8} {'-'*9} {'-'*9}")
-        for p in rp_det:
-            print(f"  {p['Name']:<28} {p['Proj_Apps']:>8.1f} {p['Used_Apps']:>8.1f} "
-                  f"{p['IP_used']:>8.1f} {p['SPTS_proj']:>10.1f} {p['SPTS_used']:>10.1f} "
-                  f"{p['SV_proj']:>8.1f} {p['SV_used']:>8.1f} {p['HLD_proj']:>9.1f} {p['HLD_used']:>9.1f}")
+        # Used SPTS lookup keyed by player name — used for roster sheet
+        # Hitters: sum across all slots a player appears in
+        used_spts: dict = {}
+        for lrow in lineup:
+            used_spts[lrow["Name"]] = used_spts.get(lrow["Name"], 0.0) + lrow["SPTS"]
+        for prow in sp_det:
+            used_spts[prow["Name"]] = used_spts.get(prow["Name"], 0.0) + prow["SPTS_used"]
+        for prow in rp_det:
+            used_spts[prow["Name"]] = used_spts.get(prow["Name"], 0.0) + prow["SPTS_used"]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 6 – Save CSV
-# ─────────────────────────────────────────────────────────────────────────────
-# CSV summary
-rankings.to_csv(OUT_PATH, index_label="Rank")
+        team_hit  = hit_df[hit_df["Team"] == team]       # projection-matched (SPTS calc)
+        team_pit  = pit_df[pit_df["Team"] == team]
+        team_hit_full = hit_full[hit_full["Team"] == team]  # all contracted players
+        team_pit_full = pit_full[pit_full["Team"] == team]
 
-# Excel workbook (summary + detail)
-rankings_with_rank = rankings.reset_index().rename(columns={"index": "Rank"})
+        # Identify true two-way players: must have a meaningful projection in BOTH
+        # the hitter AND pitcher projection file. Using projection-file PlayerIds
+        # prevents pitchers with 1 PA from being flagged as two-way via the
+        # roster-file overlap.
+        _hit_proj_pids = set(hit_proj["PlayerId"].astype(str))
+        _pit_proj_pids  = set(pit_proj["PlayerId"].astype(str))
+        _twoway_proj    = _hit_proj_pids & _pit_proj_pids
+        hit_pids        = set(team_hit_full["PlayerId"].astype(str))
+        pit_pids        = set(team_pit_full["PlayerId"].astype(str))
+        twoway_pids     = (hit_pids & pit_pids) & _twoway_proj
+        pit_sal_df      = team_pit_full[~team_pit_full["PlayerId"].astype(str).isin(twoway_pids)]
 
-team_rank = rankings["Team"].to_dict()  # {rank_index: team_name}
-team_rank = {v: k for k, v in team_rank.items()}  # invert → {team_name: rank}
+        # Salary & age aggregations (all rostered players, deduplicated)
+        # Compute SP/RP role inline from best available stats (projection > roster CSV)
+        def _pit_role(p):
+            _ip  = p.get("IP",  0) or p.get("Ros_IP",  0)
+            _sv  = p.get("SV",  0) or p.get("Ros_SV",  0)
+            _hld = p.get("HLD", 0) or p.get("Ros_HLD", 0)
+            return "RP" if (_sv > 2 or _hld > 5 or _ip < 70) else "SP"
 
-lineup_records = []
-for team, lineup in team_lineups.items():
-    for row in lineup:
-        lineup_records.append({
-            "Rank":    team_rank.get(team),
-            "Team":    team,
-            "MLBAMID": _name_to_mlbam.get(row["Name"]),
-            **row,
+        sal_hit  = float(team_hit_full["Salary"].sum())
+        sal_sp   = sum(float(p.get("Salary", 0)) for _, p in pit_sal_df.iterrows()
+                       if _pit_role(p) == "SP")
+        sal_rp   = sum(float(p.get("Salary", 0)) for _, p in pit_sal_df.iterrows()
+                       if _pit_role(p) == "RP")
+        age_hit  = team_hit_full[["PlayerId", "Age"]].drop_duplicates("PlayerId")
+        age_pit  = pit_sal_df[["PlayerId", "Age"]].drop_duplicates("PlayerId")
+        all_ages = pd.concat([age_hit["Age"], age_pit["Age"]]).dropna()
+        avg_age  = round(float(all_ages.mean()), 1) if len(all_ages) > 0 else 0.0
+
+        # Collect per-player rows for the Roster sheet (all contracted players)
+        # Pos: DH → Util (DH-only hitters fill the Util slot in Ottoneu)
+        # Role: H / TWP for hitters; SP / RP computed inline for pitchers
+        # SPTS: constrained used SPTS (0 if not in lineup / no projection)
+        for _, p in team_hit_full.iterrows():
+            pid  = str(p.get("PlayerId", ""))
+            role = "TWP" if pid in twoway_pids else "H"
+            raw_pos = p.get("Pos", "?")
+            display_pos = "Util" if raw_pos == "DH" else raw_pos
+            _mid = p.get("MLBAMID")
+            _mid_int = int(_mid) if pd.notna(_mid) else None
+            roster_records.append({
+                "Team":    team,  "Name": p["Name"],
+                "Role":    role,  "Pos":  display_pos,
+                "Salary":  p.get("Salary", 0),
+                "Age":     p.get("Age"),
+                "MLBAMID": _mid_int,
+                "SPTS":    round(used_spts.get(p["Name"], 0.0), 1),
+            })
+        for _, p in team_pit_full.iterrows():
+            if str(p.get("PlayerId", "")) in twoway_pids:
+                continue  # salary already recorded on hitting side
+            # Compute SP/RP inline using best available stats (proj > roster CSV)
+            _ip  = p.get("IP",  0) or p.get("Ros_IP",  0)
+            _sv  = p.get("SV",  0) or p.get("Ros_SV",  0)
+            _hld = p.get("HLD", 0) or p.get("Ros_HLD", 0)
+            role = "RP" if (_sv > 2 or _hld > 5 or _ip < 70) else "SP"
+            _mid = p.get("MLBAMID")
+            _mid_int = int(_mid) if pd.notna(_mid) else None
+            roster_records.append({
+                "Team":    team,  "Name": p["Name"],
+                "Role":    role,  "Pos":  role,
+                "Salary":  p.get("Salary", 0),
+                "Age":     p.get("Age"),
+                "MLBAMID": _mid_int,
+                "SPTS":    round(used_spts.get(p["Name"], 0.0), 1),
+            })
+
+        raw_hit = team_hit["SPTS"].sum()
+        raw_pit = team_pit["SPTS"].sum()
+
+        sp_ip_used = sum(p["IP_used"] for p in sp_det)
+        rp_ip_used = sum(p["IP_used"] for p in rp_det)
+
+        results.append({
+            "Team":       team,
+            "Hit_SPTS":   round(hit_spts, 1),
+            "SP_SPTS":    round(sp_spts, 1),
+            "RP_SPTS":    round(rp_spts, 1),
+            "Pit_SPTS":   round(sp_spts + rp_spts, 1),
+            "Total_SPTS": round(hit_spts + sp_spts + rp_spts, 1),
+            "Hit_AB":     round(hit_ab, 1),
+            "Hit_H":      round(hit_h, 1),
+            "Hit_2B":     round(hit_2b, 1),
+            "Hit_BB":     round(hit_bb, 1),
+            "Hit_HR":     round(hit_hr, 1),
+            "Hit_SB":     round(hit_sb, 1),
+            "Hit_wOBA":   round(hit_woba, 3),
+            "Hit_OPS":    round(hit_ops, 3),
+            "Pit_IP":     round(sp_ip_used + rp_ip_used, 1),
+            "SV":         sv_constrained,
+            "HLD":        hld_constrained,
+            "Pit_K":      pit_k,
+            "Pit_BB":     pit_bb,
+            "Pit_HR":     pit_hr,
+            "Pit_FIP":    pit_fip,
+            "SP_IP":      round(sp_ip_used, 1),
+            "RP_IP":      round(rp_ip_used, 1),
+            "Total_IP":   round(sp_ip_used + rp_ip_used, 1),
+            "Raw_Hit":    round(raw_hit, 1),
+            "Raw_Pit":    round(raw_pit, 1),
+            "Raw_Total":  round(raw_hit + raw_pit, 1),
+            "N_Bat":      len(team_hit_full),
+            "N_Pit":      len(team_pit_full),
+            "Total_Salary": round(sal_hit + sal_sp + sal_rp, 0),
+            "Sal_Hit":      round(sal_hit, 0),
+            "Sal_SP":       round(sal_sp, 0),
+            "Sal_RP":       round(sal_rp, 0),
+            "Avg_Age":      avg_age,
         })
 
-sp_records, rp_records = [], []
-for team, (sp_det, rp_det) in team_pitching.items():
-    for row in sp_det:
-        sp_records.append({"Rank": team_rank.get(team), "Team": team,
-                           "MLBAMID": _name_to_mlbam.get(row["Name"]), **row})
-    for row in rp_det:
-        rp_records.append({"Rank": team_rank.get(team), "Team": team,
-                           "MLBAMID": _name_to_mlbam.get(row["Name"]), **row})
+    roster_df = pd.DataFrame(roster_records)
 
-lineup_df = pd.DataFrame(lineup_records)
-sp_df_out = pd.DataFrame(sp_records)
-rp_df_out = pd.DataFrame(rp_records)
+    rankings = (pd.DataFrame(results)
+                  .sort_values("Total_SPTS", ascending=False)
+                  .reset_index(drop=True))
+    rankings.index += 1
 
+    # -- Build output DataFrames ------------------------------------------------
+    rankings_with_rank = rankings.reset_index().rename(columns={"index": "Rank"})
+    team_rank = {v: k for k, v in rankings["Team"].to_dict().items()}
+
+    lineup_records = []
+    for _team, _lineup in team_lineups.items():
+        for _row in _lineup:
+            lineup_records.append({
+                "Rank":    team_rank.get(_team),
+                "Team":    _team,
+                "MLBAMID": _name_to_mlbam.get(_row["Name"]),
+                **_row,
+            })
+
+    sp_records, rp_records = [], []
+    for _team, (_sp_det, _rp_det) in team_pitching.items():
+        for _row in _sp_det:
+            sp_records.append({"Rank": team_rank.get(_team), "Team": _team,
+                                "MLBAMID": _name_to_mlbam.get(_row["Name"]), **_row})
+        for _row in _rp_det:
+            rp_records.append({"Rank": team_rank.get(_team), "Team": _team,
+                                "MLBAMID": _name_to_mlbam.get(_row["Name"]), **_row})
+
+    hitters_df = pd.DataFrame(lineup_records)
+    sp_df      = pd.DataFrame(sp_records)
+    rp_df      = pd.DataFrame(rp_records)
+
+    return {
+        "sys_name":  sys_name,
+        "rankings":  rankings_with_rank,
+        "hitters":   hitters_df,
+        "sp":        sp_df,
+        "rp":        rp_df,
+        "roster":    roster_df,
+        "lineups":   team_lineups,
+        "pitching":  team_pitching,
+    }
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3 -- Run all projection systems
+# ─────────────────────────────────────────────────────────────────────────────
+all_results: dict = {}
+for _sys_name, (_hit_file, _pit_file) in PROJ_SYSTEMS.items():
+    all_results[_sys_name] = run_projection_system(_sys_name, _hit_file, _pit_file)
+
+# Print power-rankings table for every system
+for _sys_name, _data in all_results.items():
+    _rnk = _data["rankings"]
+    print("\n" + "=" * W)
+    print(f"{'OTTONEU 2026 POWER RANKINGS  --  ' + _sys_name + '  (Lineup-Constrained)':^{W}}")
+    print("=" * W)
+    print(f"{'Rank':<5} {'Team':<14} {'Hit SPTS':>9} {'SP SPTS':>8} {'RP SPTS':>8} "
+          f"{'TOTAL':>9}  {'SP IP':>7} {'RP IP':>7} {'Tot IP':>7} "
+          f"{'SV':>6} {'HLD':>6}")
+    print("-" * W)
+    for _, row in _rnk.iterrows():
+        print(
+            f"{row['Rank']:<5} {row['Team']:<14} {row['Hit_SPTS']:>9,.1f} "
+            f"{row['SP_SPTS']:>8,.1f} {row['RP_SPTS']:>8,.1f} "
+            f"{row['Total_SPTS']:>9,.1f}  "
+            f"{row['SP_IP']:>7,.1f} {row['RP_IP']:>7,.1f} {row['Total_IP']:>7,.1f} "
+            f"{row['SV']:>6,.1f} {row['HLD']:>6,.1f}"
+        )
+    print("=" * W)
+
+# Save CSV (first system only)
+_first_data = next(iter(all_results.values()))
+_first_data["rankings"].to_csv(OUT_PATH, index=False)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 4 -- Save XLSX (all projection systems, each in its own prefixed sheets)
+# Sheet naming:  "ZiPS DC" -> prefix "ZiPS_DC"
+#   ZiPS_DC_Summary | ZiPS_DC_Hitters | ZiPS_DC_SP_Detail | ZiPS_DC_RP_Detail | ZiPS_DC_Roster
+# ─────────────────────────────────────────────────────────────────────────────
 with pd.ExcelWriter(OUT_XLSX) as writer:
-    rankings_with_rank.to_excel(writer, sheet_name="Summary", index=False)
-    if not lineup_df.empty:
-        lineup_df.sort_values(["Rank", "Slot", "SPTS/G"], ascending=[True, True, False]).to_excel(
-            writer, sheet_name="Hitters", index=False
-        )
-    if not sp_df_out.empty:
-        sp_df_out.sort_values(["Rank", "SPTS_used"], ascending=[True, False]).to_excel(
-            writer, sheet_name="SP_Detail", index=False
-        )
-    if not rp_df_out.empty:
-        rp_df_out.sort_values(["Rank", "SPTS_used"], ascending=[True, False]).to_excel(
-            writer, sheet_name="RP_Detail", index=False
-        )
-    if not roster_df.empty:
-        roster_df["SPTS_per_$"] = roster_df.apply(
-            lambda r: round(float(r["SPTS"]) / float(r["Salary"]), 2)
-            if r.get("Salary", 0) > 0 else 0.0, axis=1
-        )
-        roster_out = roster_df.sort_values(
-            ["Team", "Salary"], ascending=[True, False]
-        )
-        # Match team name display mapping already applied to rankings
-        roster_out.to_excel(writer, sheet_name="Roster", index=False)
+    for _sys_name, _data in all_results.items():
+        _pfx  = _sys_name.replace(" ", "_")
+        _rnk  = _data["rankings"]
+        _hit  = _data["hitters"]
+        _sp   = _data["sp"]
+        _rp   = _data["rp"]
+        _ros  = _data["roster"]
 
-print(f"\n{'='*W}")
+        _rnk.to_excel(writer, sheet_name=f"{_pfx}_Summary", index=False)
+        if not _hit.empty:
+            _hit.sort_values(["Rank", "Slot", "SPTS/G"],
+                             ascending=[True, True, False]).to_excel(
+                writer, sheet_name=f"{_pfx}_Hitters", index=False)
+        if not _sp.empty:
+            _sp.sort_values(["Rank", "SPTS_used"],
+                            ascending=[True, False]).to_excel(
+                writer, sheet_name=f"{_pfx}_SP_Detail", index=False)
+        if not _rp.empty:
+            _rp.sort_values(["Rank", "SPTS_used"],
+                            ascending=[True, False]).to_excel(
+                writer, sheet_name=f"{_pfx}_RP_Detail", index=False)
+        if not _ros.empty:
+            _ros["SPTS_per_$"] = _ros.apply(
+                lambda r: round(float(r["SPTS"]) / float(r["Salary"]), 2)
+                if r.get("Salary", 0) > 0 else 0.0, axis=1
+            )
+            _ros.sort_values(["Team", "Salary"], ascending=[True, False]).to_excel(
+                writer, sheet_name=f"{_pfx}_Roster", index=False)
+
 print(f"Rankings saved -> {OUT_PATH}")
 print(f"Workbook saved  -> {OUT_XLSX}")

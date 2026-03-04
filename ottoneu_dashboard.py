@@ -264,10 +264,6 @@ def _cap_usage_block(team: str, ctx=None) -> html.Div:
                "textTransform": "uppercase", "letterSpacing": "0.1em"}),
         usage_bar("SP Starts",  starts_used, _SP_STARTS_CAP, "starts"),
         usage_bar("RP Apps",    apps_used,   _RP_APPS_CAP,   "apps"),
-        usage_bar("SP IP",      float(sp_team["IP_used"].sum()) if not sp_team.empty else 0.0,
-                  round(_SP_STARTS_CAP * 5.25), "IP"),
-        usage_bar("RP IP",      float(rp_team["IP_used"].sum()) if not rp_team.empty else 0.0,
-                  _RP_APPS_CAP, "IP"),
     ], style={"flex": "1"})
 
     slot_bars = html.Div([

@@ -26,6 +26,8 @@ SEASON_DAYS    = 140         # regular-season game-days (no playoffs)
 SP_STARTS_CAP  = 10 * SEASON_WEEKS   # 210 starts / season
 RP_APPS_CAP    = 400                 # RP innings/appearances cap
 IP_PER_START   = 5.25                 # fallback innings per SP outing (used only when GS = 0)
+SCHEDULE_SCALE = 140 / 162           # scale 162-game projections down to 140-game regular season
+MAX_PLAYER_G   = 140                 # hard cap on games any single player can contribute
 
 # ── File paths ────────────────────────────────────────────────────────────────
 # Roster files  – leaderboard exports that contain the Fantasy/team column
@@ -93,7 +95,7 @@ def optimal_lineup_spts(roster: pd.DataFrame) -> tuple:
     # Projected games = season SPTS / SPTS-per-game (floor at 1)
     roster["proj_G"] = (
         roster["SPTS"] / roster["SPTS/G"].replace(0, np.nan)
-    ).clip(lower=1).fillna(1).round()
+    ).clip(lower=1, upper=MAX_PLAYER_G).fillna(1).round()
     roster["rem_G"] = roster["proj_G"].copy()
 
     # Scarcity order: positional slots first, flex last
@@ -371,6 +373,18 @@ for col in ("SPTS", "IP", "SV", "HLD", "GS", "SO", "BB", "HR", "FIP"):
             print(f"  !! 'GS' column not found in pitcher projections - IP/start will default to {IP_PER_START}.")
             print(f"     Columns found: {list(pit_df.columns)}")
     pit_full[col] = pd.to_numeric(pit_full.get(col, 0), errors="coerce").fillna(0)
+
+# Scale all cumulative (season-total) stats from a 162-game season down to the
+# 140-game regular season.  Per-game/per-inning rate columns (SPTS/G, FIP, wOBA,
+# OPS) are NOT scaled — they are already rate stats and remain unchanged.
+_HIT_SCALE_COLS = ["SPTS", "AB", "H", "2B", "BB", "HR", "SB"]
+_PIT_SCALE_COLS = ["SPTS", "IP", "GS", "SV", "HLD"]
+for _col in _HIT_SCALE_COLS:
+    for _df in (hit_df, hit_full):
+        _df[_col] = _df[_col] * SCHEDULE_SCALE
+for _col in _PIT_SCALE_COLS:
+    for _df in (pit_df, pit_full):
+        _df[_col] = _df[_col] * SCHEDULE_SCALE
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 2 – Fetch position data via MLB Stats API (uses MLBAMID, free/no-auth)

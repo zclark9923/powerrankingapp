@@ -685,8 +685,8 @@ def _photo_md(mid) -> str:
     try:
         return (
             f'<img src="https://img.mlbstatic.com/mlb-photos/image/upload/'
-            f'w_40,q_100/v1/people/{int(mid)}/headshot/67/current" '
-            f'style="border-radius:6px;width:40px;height:auto;">'
+            f'w_28,q_100/v1/people/{int(mid)}/headshot/67/current" '
+            f'style="border-radius:4px;width:28px;height:auto;">'
         )
     except (ValueError, TypeError):
         return ""
@@ -698,8 +698,8 @@ def _photo_col_def() -> dict:
 
 
 _PHOTO_CELL_STYLE = [
-    {"if": {"column_id": "Photo"}, "width": "52px", "minWidth": "52px",
-     "maxWidth": "52px", "padding": "0px 4px", "textAlign": "center"},
+    {"if": {"column_id": "Photo"}, "width": "36px", "minWidth": "36px",
+     "maxWidth": "36px", "padding": "0px 4px", "textAlign": "center"},
     {"if": {"column_id": "Name"}, "width": "260px", "minWidth": "200px",
      "maxWidth": "300px", "textAlign": "center"},
     {"if": {"column_id": "Slot"}, "width": "55px", "minWidth": "55px",
@@ -709,7 +709,7 @@ _PHOTO_CELL_STYLE = [
 # Raw CSS injected into photo tables to kill the inner div padding that
 # the Python style props cannot reach
 _PHOTO_CSS = [
-    {"selector": "td.dash-cell", "rule": "padding-top: 0 !important; padding-bottom: 0 !important; line-height: 1;"},
+    {"selector": "td.dash-cell", "rule": "padding-top: 3px !important; padding-bottom: 3px !important; line-height: 1;"},
     {"selector": "td.dash-cell div.dash-cell-value", "rule": "padding: 0 !important; line-height: 1;"},
     {"selector": "td.dash-cell img", "rule": "display: block; margin: 0 auto;"},
 ]
@@ -750,7 +750,7 @@ def roster_table(team: str, ctx=None) -> dash_table.DataTable:
         markdown_options={"html": True},
         css=_PHOTO_CSS,
         **{**_TABLE_STYLE,
-           "style_data": {**_TABLE_STYLE["style_data"], "fontSize": "24px", "padding": "0px 6px"},
+           "style_data": {**_TABLE_STYLE["style_data"], "fontSize": "13px", "padding": "2px 6px"},
            "page_size": 30},
     )
 
@@ -809,7 +809,7 @@ def hitter_table(team: str, ctx=None) -> dash_table.DataTable:
         style_cell_conditional=_PHOTO_CELL_STYLE,
         markdown_options={"html": True},
         css=_PHOTO_CSS,
-        **{**_TABLE_STYLE, "style_data": {**_TABLE_STYLE["style_data"], "fontSize": "24px", "padding": "0px 6px"}},
+        **{**_TABLE_STYLE, "style_data": {**_TABLE_STYLE["style_data"], "fontSize": "13px", "padding": "2px 6px"}},
     )
 
 
@@ -839,7 +839,7 @@ def sp_table(team: str, ctx=None) -> dash_table.DataTable:
         style_cell_conditional=_PHOTO_CELL_STYLE,
         markdown_options={"html": True},
         css=_PHOTO_CSS,
-        **{**_TABLE_STYLE, "style_data": {**_TABLE_STYLE["style_data"], "fontSize": "24px", "padding": "0px 6px"}},
+        **{**_TABLE_STYLE, "style_data": {**_TABLE_STYLE["style_data"], "fontSize": "13px", "padding": "2px 6px"}},
     )
 
 
@@ -869,7 +869,7 @@ def rp_table(team: str, ctx=None) -> dash_table.DataTable:
         style_cell_conditional=_PHOTO_CELL_STYLE,
         markdown_options={"html": True},
         css=_PHOTO_CSS,
-        **{**_TABLE_STYLE, "style_data": {**_TABLE_STYLE["style_data"], "fontSize": "24px", "padding": "0px 6px"}},
+        **{**_TABLE_STYLE, "style_data": {**_TABLE_STYLE["style_data"], "fontSize": "13px", "padding": "2px 6px"}},
     )
 
 

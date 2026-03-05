@@ -2161,11 +2161,12 @@ def reset_trade(_):
     State("trade-players-b", "value"),
     State("trade-drop-b",    "value"),
     State("proj-system-radio", "value"),
+    State("trade-patch-store", "data"),
     prevent_initial_call=True,
 )
 def evaluate_trade(n_clicks, team_a, players_a, drop_a,
-                   team_b, players_b, drop_b, sys_val):
-    _no_store = None   # returned when we don’t want to commit a patch
+                   team_b, players_b, drop_b, sys_val, patch_data):
+    _no_store = patch_data   # preserve existing patches on early return/error
 
     if not team_a or not team_b:
         return html.P("Please select both teams.", style={"color": C_MUTED}), _no_store

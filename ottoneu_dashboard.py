@@ -1110,6 +1110,7 @@ app.layout = html.Div(className="page-wrap", style={
 
     dcc.Store(id="trade-patch-store", storage_type="session"),
     dcc.Store(id="opt-results-store",  storage_type="memory"),
+    dcc.Store(id="fa-best-store",      storage_type="memory"),
 
     dcc.Tabs(id="main-tabs", value="rankings",
              style={"marginBottom": "24px"},
@@ -1334,6 +1335,53 @@ app.layout = html.Div(className="page-wrap", style={
                       "marginBottom": "28px"}),
 
             html.Div(id="trade-result"),
+
+            # ── Best FA Pickups ────────────────────────────────────────────
+            html.Div([
+                html.H3("⭐ Best Free Agent Pickups",
+                        style={"margin": "0 0 6px", "fontSize": "16px",
+                               "fontWeight": "700", "color": C_AMBER}),
+                html.P(
+                    "Scans the FA pool and runs the full lineup algorithm to find the "
+                    "pickups that would add the most projected SPTS to your roster.",
+                    style={"color": C_MUTED, "fontSize": "12px", "marginBottom": "16px"},
+                ),
+                html.Div([
+                    html.Div([
+                        html.Label("Team to evaluate",
+                                   style={"color": C_MUTED, "fontSize": "12px",
+                                          "marginBottom": "4px", "display": "block"}),
+                        dcc.Dropdown(
+                            id="fa-team-pick",
+                            options=[{"label": t, "value": t} for t in teams],
+                            value=teams[0], clearable=False,
+                            style={"color": "#0F172A"},
+                        ),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        html.Label("\u00a0",
+                                   style={"display": "block", "marginBottom": "4px"}),
+                        html.Button(
+                            "Find Best FA Pickups",
+                            id="fa-find-btn", n_clicks=0,
+                            style={
+                                "background": C_AMBER, "color": "#0F172A",
+                                "border": "none", "borderRadius": "8px",
+                                "padding": "10px 22px", "fontSize": "13px",
+                                "fontWeight": "700", "cursor": "pointer",
+                                "whiteSpace": "nowrap",
+                            },
+                        ),
+                    ], style={"flex": "none"}),
+                ], style={"display": "flex", "gap": "16px", "alignItems": "flex-end",
+                          "marginBottom": "16px"}),
+                dcc.Loading(
+                    type="dot",
+                    color=C_AMBER,
+                    children=html.Div(id="fa-results"),
+                ),
+            ], style={"background": C_CARD, "borderRadius": "12px", "padding": "20px",
+                      "marginTop": "28px"}),
         ]),
 
         # ── Tab 5: Trade Optimizer ────────────────────────────────────────────
@@ -1801,6 +1849,7 @@ def _get_ctx(sys_val: str, patch_data) -> SysCtx:
 
 
 _FA_POOL_LIMIT = 150   # max FA players shown in the picker (already sorted by SPTS)
+_FA_SCAN_CAP  = 100   # max FA players evaluated by the Best FA Pickups scanner (by raw SPTS)
 
 
 def _fmt_hit_opts(df: pd.DataFrame) -> pd.DataFrame:
@@ -1849,6 +1898,29 @@ def _trade_player_options(team: str, ctx) -> list:
     return combined[["label", "value"]].to_dict("records")
 
 
+def _calc_team_spts(team: str, hf: pd.DataFrame, pf: pd.DataFrame) -> dict:
+    """Compute SPTS breakdown for one team from the given hf/pf frames."""
+    roster_h = hf[hf["Team"] == team][[c for c in _TRADE_HIT_COLS if c in hf.columns]].copy()
+    for col in ("SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"):
+        if col in roster_h.columns:
+            roster_h[col] = pd.to_numeric(roster_h[col], errors="coerce").fillna(0)
+    if "SPTS/G" in roster_h.columns and "SPTS" in roster_h.columns:
+        _mask = (roster_h["SPTS/G"] == 0) & (roster_h["SPTS"] > 0)
+        if _mask.any():
+            roster_h.loc[_mask, "SPTS/G"] = roster_h.loc[_mask, "SPTS"] / _SLOT_G_CAP
+    roster_p = pf[pf["Team"] == team].copy()
+    for col in _TRADE_PIT_NUMS:
+        if col in roster_p.columns:
+            roster_p[col] = pd.to_numeric(roster_p[col], errors="coerce").fillna(0)
+        else:
+            roster_p[col] = 0.0
+    hit_spts, *_         = optimal_lineup_spts(roster_h)
+    sp_spts, rp_spts, *_ = constrained_pitcher_spts(roster_p)
+    return {"Hit_SPTS": round(hit_spts, 1), "SP_SPTS": round(sp_spts, 1),
+            "RP_SPTS":  round(rp_spts,  1),
+            "Total_SPTS": round(hit_spts + sp_spts + rp_spts, 1)}
+
+
 def _evaluate_trade_logic(team_a, players_a, drop_a,
                           team_b, players_b, drop_b, ctx):
     """
@@ -1875,28 +1947,6 @@ def _evaluate_trade_logic(team_a, players_a, drop_a,
         team_b, players_b, drop_b,
     )
 
-    def _team_spts(team, h, p):
-        roster_h = h[h["Team"] == team][[c for c in _TRADE_HIT_COLS if c in h.columns]].copy()
-        for col in ("SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"):
-            if col in roster_h.columns:
-                roster_h[col] = pd.to_numeric(roster_h[col], errors="coerce").fillna(0)
-        # Derive SPTS/G for FA additions that lack it (avoids optimizer giving them 0 SPTS)
-        if "SPTS/G" in roster_h.columns and "SPTS" in roster_h.columns:
-            _mask = (roster_h["SPTS/G"] == 0) & (roster_h["SPTS"] > 0)
-            if _mask.any():
-                roster_h.loc[_mask, "SPTS/G"] = (roster_h.loc[_mask, "SPTS"] / _SLOT_G_CAP)
-        roster_p = p[p["Team"] == team].copy()
-        for col in _TRADE_PIT_NUMS:
-            if col in roster_p.columns:
-                roster_p[col] = pd.to_numeric(roster_p[col], errors="coerce").fillna(0)
-            else:
-                roster_p[col] = 0.0
-        hit_spts, *_         = optimal_lineup_spts(roster_h)
-        sp_spts, rp_spts, *_ = constrained_pitcher_spts(roster_p)
-        return {"Hit_SPTS": round(hit_spts, 1), "SP_SPTS": round(sp_spts, 1),
-                "RP_SPTS":  round(rp_spts,  1),
-                "Total_SPTS": round(hit_spts + sp_spts + rp_spts, 1)}
-
     def _before(team):
         row = ctx.summary[ctx.summary["Team"] == team]
         if row.empty:
@@ -1910,8 +1960,8 @@ def _evaluate_trade_logic(team_a, players_a, drop_a,
 
     # Only evaluate real (non-FA) teams, deduplicated
     eval_teams = list(dict.fromkeys(t for t in [team_a, team_b] if t != _FA_TEAM))
-    before     = {t: _before(t)          for t in eval_teams}
-    after      = {t: _team_spts(t, hf, pf) for t in eval_teams}
+    before     = {t: _before(t)              for t in eval_teams}
+    after      = {t: _calc_team_spts(t, hf, pf) for t in eval_teams}
 
     # Re-rank the whole league
     totals = {}
@@ -2175,6 +2225,199 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 
 
 # ── Active-trade banner ────────────────────────────────────────────────────────────────
+
+# ── Best FA Pickups callbacks ─────────────────────────────────────────────────
+@app.callback(
+    Output("fa-results",    "children"),
+    Output("fa-best-store", "data"),
+    Input("fa-find-btn",    "n_clicks"),
+    State("fa-team-pick",      "value"),
+    State("proj-system-radio", "value"),
+    State("trade-patch-store", "data"),
+    prevent_initial_call=True,
+)
+def find_best_fa_pickups(n_clicks, team, sys_val, patch_data):
+    if not n_clicks or not team:
+        raise PreventUpdate
+
+    ctx_obj = _get_ctx(sys_val, patch_data)
+    hf = ctx_obj.hit_full.copy()
+    pf = ctx_obj.pit_full.copy()
+
+    if hf.empty or pf.empty:
+        return html.P("Roster data unavailable — re-run ottoneu_power_rankings.py.",
+                      style={"color": "#EF4444"}), []
+    if ctx_obj.fa_hit.empty and ctx_obj.fa_pit.empty:
+        return html.P("No FA pool data found in the workbook.",
+                      style={"color": C_MUTED}), []
+
+    baseline   = _calc_team_spts(team, hf, pf)
+    base_total = baseline["Total_SPTS"]
+    candidates = []
+
+    # ── Scan FA hitters ───────────────────────────────────────────────────
+    if not ctx_obj.fa_hit.empty:
+        fa_h = ctx_obj.fa_hit.copy()
+        fa_h["_spts"] = pd.to_numeric(fa_h["SPTS"]   if "SPTS"   in fa_h.columns else 0,
+                                      errors="coerce").fillna(0)
+        fa_h["_sal"]  = pd.to_numeric(fa_h["Salary"] if "Salary" in fa_h.columns else 0,
+                                      errors="coerce").fillna(0)
+        for _, row in fa_h.sort_values("_spts", ascending=False).head(_FA_SCAN_CAP).iterrows():
+            name   = str(row["Name"])
+            fa_row = ctx_obj.fa_hit[ctx_obj.fa_hit["Name"] == name].copy()
+            fa_row["Team"] = team
+            result = _calc_team_spts(team, pd.concat([hf, fa_row], ignore_index=True), pf)
+            delta  = round(result["Total_SPTS"] - base_total, 1)
+            if delta > 0:
+                candidates.append({
+                    "name":     name,
+                    "role":     "H",
+                    "pos":      str(row.get("Pos", "?")),
+                    "salary":   float(row["_sal"]),
+                    "raw_spts": float(row["_spts"]),
+                    "delta":    delta,
+                    "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
+                    "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
+                    "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
+                    "team":     team,
+                })
+
+    # ── Scan FA pitchers ──────────────────────────────────────────────────
+    if not ctx_obj.fa_pit.empty:
+        fa_p = ctx_obj.fa_pit.copy()
+        for col in _TRADE_PIT_NUMS + ["Salary"]:
+            fa_p[col] = pd.to_numeric(fa_p[col] if col in fa_p.columns else 0,
+                                      errors="coerce").fillna(0)
+        fa_p["_spts"] = fa_p["SPTS"]
+        fa_p["_sal"]  = fa_p["Salary"]
+        for _, row in fa_p.sort_values("_spts", ascending=False).head(_FA_SCAN_CAP).iterrows():
+            name   = str(row["Name"])
+            role   = "RP" if (row["SV"] > 2 or row["HLD"] > 5 or row["IP"] < 70) else "SP"
+            fa_row = ctx_obj.fa_pit[ctx_obj.fa_pit["Name"] == name].copy()
+            fa_row["Team"] = team
+            for col in ("Ros_IP", "Ros_SV", "Ros_HLD"):
+                if col not in fa_row.columns:
+                    fa_row[col] = 0.0
+            result = _calc_team_spts(team, hf, pd.concat([pf, fa_row], ignore_index=True))
+            delta  = round(result["Total_SPTS"] - base_total, 1)
+            if delta > 0:
+                candidates.append({
+                    "name":     name,
+                    "role":     role,
+                    "pos":      role,
+                    "salary":   float(row["_sal"]),
+                    "raw_spts": float(row["_spts"]),
+                    "delta":    delta,
+                    "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
+                    "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
+                    "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
+                    "team":     team,
+                })
+
+    candidates.sort(key=lambda c: c["delta"], reverse=True)
+    top5 = candidates[:5]
+
+    if not top5:
+        return html.P(
+            "No FA pickups would positively contribute to the lineup after optimization. "
+            "The FA pool may be sparse or your roster is already well-optimised at all positions.",
+            style={"color": C_MUTED, "fontStyle": "italic", "marginTop": "8px"},
+        ), []
+
+    role_clr = {"H": C_HIT, "SP": C_SP, "RP": C_RP}
+    cards = []
+    for i, c in enumerate(top5, 1):
+        rc = role_clr.get(c["role"], C_SP)
+        breakdown = "  ·  ".join(
+            f"{lbl} {'+' if v >= 0 else ''}{v:.1f}"
+            for lbl, v in [("Hit", c["d_hit"]), ("SP", c["d_sp"]), ("RP", c["d_rp"])]
+            if abs(v) > 0
+        )
+        cards.append(html.Div([
+            html.Div([
+                html.Span(str(i), style={
+                    "display": "inline-flex", "alignItems": "center",
+                    "justifyContent": "center", "width": "24px", "height": "24px",
+                    "borderRadius": "50%", "background": rc, "color": "#fff",
+                    "fontSize": "12px", "fontWeight": "700", "flexShrink": "0",
+                }),
+                html.Div([
+                    html.Span(c["name"],
+                              style={"fontWeight": "700", "fontSize": "14px"}),
+                    html.Span(f"  {c['pos']}",
+                              style={"color": rc, "fontSize": "12px", "marginLeft": "6px"}),
+                    html.Span(f"  ${c['salary']:.0f}",
+                              style={"color": C_MUTED, "fontSize": "12px",
+                                     "marginLeft": "6px"}),
+                    html.Span(f"  {c['raw_spts']:.1f} proj SPTS",
+                              style={"color": C_MUTED, "fontSize": "12px",
+                                     "marginLeft": "6px"}),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Span(f"+{c['delta']:.1f}",
+                              style={"color": "#22C55E", "fontWeight": "700",
+                                     "fontSize": "18px"}),
+                    html.Span(" SPTS",
+                              style={"color": C_MUTED, "fontSize": "12px",
+                                     "marginLeft": "3px"}),
+                    html.Div(breakdown,
+                             style={"color": C_MUTED, "fontSize": "11px",
+                                    "textAlign": "right"}),
+                ], style={"textAlign": "right", "flexShrink": "0"}),
+                html.Button("Apply pickup",
+                             id={"type": "fa-apply-btn", "index": i},
+                             n_clicks=0,
+                             style={
+                                 "background": "transparent", "color": rc,
+                                 "border": f"1px solid {rc}", "borderRadius": "6px",
+                                 "padding": "6px 14px", "fontSize": "12px",
+                                 "cursor": "pointer", "whiteSpace": "nowrap",
+                                 "marginLeft": "12px", "flexShrink": "0",
+                             }),
+            ], style={"display": "flex", "alignItems": "center", "gap": "12px"}),
+        ], style={
+            "background": C_BG, "borderRadius": "8px", "padding": "14px 16px",
+            "marginBottom": "10px", "border": f"1px solid {C_GRID}",
+        }))
+
+    footer = html.P(
+        f"Scanned top {_FA_SCAN_CAP} FA hitters + pitchers against {team}'s roster — "
+        f"showing top {len(top5)} of {len(candidates)} positive-delta pickups. "
+        "Click \u2018Apply pickup\u2019 to simulate the addition across all dashboard tabs.",
+        style={"color": C_MUTED, "fontSize": "11px",
+               "marginTop": "12px", "textAlign": "center"},
+    )
+    return html.Div(cards + [footer]), top5
+
+
+@app.callback(
+    Output("trade-patch-store", "data", allow_duplicate=True),
+    Input({"type": "fa-apply-btn", "index": ALL}, "n_clicks"),
+    State("fa-best-store",     "data"),
+    State("proj-system-radio", "value"),
+    prevent_initial_call=True,
+)
+def apply_fa_pickup(n_clicks_list, fa_candidates, sys_val):
+    if not any(n for n in (n_clicks_list or []) if n):
+        raise PreventUpdate
+    triggered = dash_ctx.triggered_id
+    if not triggered or not isinstance(triggered, dict):
+        raise PreventUpdate
+    clicked_idx = int(triggered["index"]) - 1   # index is 1-based
+    if not fa_candidates or clicked_idx >= len(fa_candidates):
+        raise PreventUpdate
+    c = fa_candidates[clicked_idx]
+    return {
+        "sys":       sys_val,
+        "team_a":    _FA_TEAM,
+        "players_a": [c["name"]],
+        "drop_a":    [],
+        "team_b":    c["team"],
+        "players_b": [],
+        "drop_b":    [],
+        "label":     f"FA pickup: {c['name']} → {c['team']} (+{c['delta']:.1f} SPTS)",
+    }
+
 
 # ── Populate untouchables dropdowns when team selection changes ───────────────
 @app.callback(

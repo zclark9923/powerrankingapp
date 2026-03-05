@@ -34,9 +34,9 @@ warnings.filterwarnings("ignore")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 SALARY_TOLERANCE = 3       # default max $ imbalance between the two trade sides
-MAX_TRADE_SIZE   = 3       # hard cap: players per side
+MAX_TRADE_SIZE   = 5       # hard cap: players per side
 POOL_TOP_N       = 30      # top-N players per team to consider (by SPTS)
-BEAM_WIDTH       = 60      # beam search width: keep this many seeds at each level
+BEAM_WIDTH       = 80      # beam search width: keep this many seeds at each level
 EXACT_CAP        = 120     # max candidates forwarded to the exact scorer
 RAW_SPTS_GATE    = 20      # reject combos where either side loses > X raw SPTS
 _SLOT_G_CAP      = 140     # hitter games cap (mirrors pipeline constant)

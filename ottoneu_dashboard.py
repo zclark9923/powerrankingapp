@@ -20,7 +20,7 @@ import plotly.express as px
 from dash import Dash, dcc, html, Input, Output, State, dash_table, ctx as dash_ctx, ALL, DiskcacheManager
 from dash.exceptions import PreventUpdate
 from pathlib import Path
-from ottoneu_power_rankings import optimal_lineup_spts, constrained_pitcher_spts, recompute_from_rosters
+from ottoneu_power_rankings import optimal_lineup_spts, constrained_pitcher_spts, recompute_from_rosters, player_eligible
 from trade_optimizer import find_optimal_trades
 
 # Background callback manager — initialised once, safely, after gunicorn has
@@ -1861,6 +1861,7 @@ def _get_ctx(sys_val: str, patch_data) -> SysCtx:
 
 _FA_POOL_LIMIT = 150   # max FA players shown in the picker (already sorted by SPTS)
 _FA_SCAN_CAP  = 200   # max FA players evaluated by the Best FA Pickups scanner (combined H+P, by raw SPTS)
+_FINALIST_N   = 10    # number of top estimated candidates (per H/P) to run full optimizer on
 
 
 def _fmt_hit_opts(df: pd.DataFrame) -> pd.DataFrame:
@@ -2280,63 +2281,99 @@ def find_best_fa_pickups(n_clicks, team, sys_val, patch_data):
                 "then commit the updated .xlsx to redeploy."
             )
 
-        baseline   = _calc_team_spts(team, hf, pf)
-        base_total = baseline["Total_SPTS"]
-        candidates = []
+        # ── Prepare team rosters (same as _calc_team_spts) ─────────────────────
+        roster_h = hf[hf["Team"] == team][[c for c in _TRADE_HIT_COLS if c in hf.columns]].copy()
+        for col in ("SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"):
+            if col in roster_h.columns:
+                roster_h[col] = pd.to_numeric(roster_h[col], errors="coerce").fillna(0)
+        if "SPTS/G" in roster_h.columns and "SPTS" in roster_h.columns:
+            _spg_mask = (roster_h["SPTS/G"] == 0) & (roster_h["SPTS"] > 0)
+            if _spg_mask.any():
+                roster_h.loc[_spg_mask, "SPTS/G"] = roster_h.loc[_spg_mask, "SPTS"] / _SLOT_G_CAP
+        roster_p = pf[pf["Team"] == team].copy()
+        for col in _TRADE_PIT_NUMS:
+            if col in roster_p.columns:
+                roster_p[col] = pd.to_numeric(roster_p[col], errors="coerce").fillna(0)
+            else:
+                roster_p[col] = 0.0
 
-        # ── Pre-compute cheap thresholds to skip non-viable FAs before optimizer ──
-        # Hitter threshold: FA's SPTS/G must beat the team's bottom-quartile hitter
-        _team_h = hf[hf["Team"] == team]
-        _team_h_spg = pd.to_numeric(
-            _team_h["SPTS/G"] if "SPTS/G" in _team_h.columns else pd.Series(dtype=float),
+        # ── Baseline optimizer (run ONCE each — not per FA) ───────────────────
+        (b_hspts, *_, lineup_detail) = optimal_lineup_spts(roster_h)
+        _pit_result = constrained_pitcher_spts(roster_p)
+        b_spspts, b_rpspts = _pit_result[0], _pit_result[1]
+        sp_detail, rp_detail = _pit_result[8], _pit_result[9]
+        base_total = round(b_hspts + b_spspts + b_rpspts, 1)
+        baseline   = {"Hit_SPTS": round(b_hspts, 1), "SP_SPTS": round(b_spspts, 1),
+                      "RP_SPTS": round(b_rpspts, 1), "Total_SPTS": base_total}
+
+        # ── Slot marginals: worst player currently filling each hitter slot ───
+        from collections import defaultdict as _dd
+        _slot_lists = _dd(list)
+        for _lr in lineup_detail:
+            _slot_lists[_lr["Slot"]].append(float(_lr.get("SPTS/G") or 0))
+        _slot_min_spg = {s: min(vs) for s, vs in _slot_lists.items()}
+        for _s in ["C", "1B", "2B", "SS", "MIF", "3B", "OF", "Util"]:
+            _slot_min_spg.setdefault(_s, 0.0)
+
+        # ── Pitcher marginals: worst SPTS/IP in current used SP/RP pools ──────
+        _sp_spi = [r["SPTS_used"] / r["IP_used"] for r in sp_detail if r.get("IP_used", 0) > 0]
+        _rp_spi = [r["SPTS_used"] / r.get("IP_used", 1) for r in rp_detail if r.get("IP_used", 0) > 0]
+        _sp_marg = min(_sp_spi) if _sp_spi else 0.0
+        _rp_marg = min(_rp_spi) if _rp_spi else 0.0
+
+        # ── Cheap per-FA estimators (NO optimizer call) ───────────────────────
+        _HIT_SLOTS_EST = [("C",140),("3B",140),("SS",140),("2B",140),
+                          ("1B",140),("MIF",140),("OF",700),("Util",140)]
+
+        def _est_h(fa_spg, fa_pos):
+            best = 0.0
+            for slot, _ in _HIT_SLOTS_EST:
+                if player_eligible(fa_pos, slot):
+                    g = (fa_spg - _slot_min_spg.get(slot, 0.0)) * 140
+                    if g > best:
+                        best = g
+            return best
+
+        def _est_p(fa_spts, fa_ip, is_rp):
+            if fa_ip <= 0:
+                return 0.0
+            spi = fa_spts / fa_ip
+            return max(0.0, (spi - (_rp_marg if is_rp else _sp_marg)) * fa_ip)
+
+        # ── Pre-compute thresholds (existing logic) ───────────────────────────
+        _h_spg_series = pd.to_numeric(
+            roster_h["SPTS/G"] if "SPTS/G" in roster_h.columns else pd.Series(dtype=float),
             errors="coerce").dropna()
-        _hit_thresh = (float(_team_h_spg.quantile(0.25)) * 0.85
-                       if not _team_h_spg.empty else 0.0)
-
-        # Pitcher threshold: FA's SPTS must beat the team's bottom-quartile pitcher
-        _team_p = pf[pf["Team"] == team]
-        _team_p_spts = pd.to_numeric(
-            _team_p["SPTS"] if "SPTS" in _team_p.columns else pd.Series(dtype=float),
+        _hit_thresh = float(_h_spg_series.quantile(0.25)) * 0.85 if not _h_spg_series.empty else 0.0
+        _p_spts_series = pd.to_numeric(
+            roster_p["SPTS"] if "SPTS" in roster_p.columns else pd.Series(dtype=float),
             errors="coerce").dropna()
-        _pit_thresh = (float(_team_p_spts.quantile(0.25)) * 0.80
-                       if not _team_p_spts.empty else 0.0)
+        _pit_thresh = float(_p_spts_series.quantile(0.25)) * 0.80 if not _p_spts_series.empty else 0.0
 
-        # ── Scan FA hitters ───────────────────────────────────────────────────
+        # ── Build finalist lists: estimate all FAs, keep top N ────────────────
+        h_finalists = []
         if not ctx_obj.fa_hit.empty:
             fa_h = ctx_obj.fa_hit.copy()
             fa_h["_spts"] = pd.to_numeric(
                 fa_h["SPTS"] if "SPTS" in fa_h.columns else pd.Series(0, index=fa_h.index),
                 errors="coerce").fillna(0)
-            fa_h["_spg"] = pd.to_numeric(
+            fa_h["_spg"]  = pd.to_numeric(
                 fa_h["SPTS/G"] if "SPTS/G" in fa_h.columns else pd.Series(0, index=fa_h.index),
                 errors="coerce").fillna(0)
             fa_h["_sal"]  = pd.to_numeric(
                 fa_h["Salary"] if "Salary" in fa_h.columns else pd.Series(0, index=fa_h.index),
                 errors="coerce").fillna(0)
-            # Pre-filter: skip FAs that can't possibly improve the worst lineup slot
             fa_h = fa_h[fa_h["_spg"] >= _hit_thresh]
-            _h_cap = max(1, _FA_SCAN_CAP // 2)  # up to half the cap for hitters
-            for _, row in fa_h.sort_values("_spts", ascending=False).head(_h_cap).iterrows():
-                name   = str(row["Name"])
-                fa_row = ctx_obj.fa_hit[ctx_obj.fa_hit["Name"] == name].copy()
-                fa_row["Team"] = team
-                result = _calc_team_spts(team, pd.concat([hf, fa_row], ignore_index=True), pf)
-                delta  = round(result["Total_SPTS"] - base_total, 1)
-                if delta > 0:
-                    candidates.append({
-                        "name":     name,
-                        "role":     "H",
-                        "pos":      str(row.get("Pos", "?")),
-                        "salary":   float(row["_sal"]),
-                        "raw_spts": float(row["_spts"]),
-                        "delta":    delta,
-                        "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
-                        "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
-                        "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
-                        "team":     team,
-                    })
+            fa_h["_est"] = fa_h.apply(
+                lambda r: _est_h(float(r["_spg"]), str(r.get("Pos", ""))), axis=1)
+            h_finalists = (
+                fa_h[fa_h["_est"] > 0]
+                .sort_values("_est", ascending=False)
+                .head(_FINALIST_N)
+                .to_dict("records")
+            )
 
-        # ── Scan FA pitchers ──────────────────────────────────────────────────
+        p_finalists = []
         if not ctx_obj.fa_pit.empty:
             fa_p = ctx_obj.fa_pit.copy()
             for col in _TRADE_PIT_NUMS + ["Salary"]:
@@ -2346,32 +2383,63 @@ def find_best_fa_pickups(n_clicks, team, sys_val, patch_data):
                     fa_p[col] = 0.0
             fa_p["_spts"] = fa_p["SPTS"]
             fa_p["_sal"]  = fa_p["Salary"]
-            # Pre-filter: skip pitchers below the team's bottom-quartile pitcher threshold
             fa_p = fa_p[fa_p["_spts"] >= _pit_thresh]
-            _p_cap = max(1, _FA_SCAN_CAP // 2)  # up to half the cap for pitchers
-            for _, row in fa_p.sort_values("_spts", ascending=False).head(_p_cap).iterrows():
-                name   = str(row["Name"])
-                role   = "RP" if (row["SV"] > 2 or row["HLD"] > 5 or row["IP"] < 70) else "SP"
-                fa_row = ctx_obj.fa_pit[ctx_obj.fa_pit["Name"] == name].copy()
-                fa_row["Team"] = team
-                for col in ("Ros_IP", "Ros_SV", "Ros_HLD"):
-                    if col not in fa_row.columns:
-                        fa_row[col] = 0.0
-                result = _calc_team_spts(team, hf, pd.concat([pf, fa_row], ignore_index=True))
-                delta  = round(result["Total_SPTS"] - base_total, 1)
-                if delta > 0:
-                    candidates.append({
-                        "name":     name,
-                        "role":     role,
-                        "pos":      role,
-                        "salary":   float(row["_sal"]),
-                        "raw_spts": float(row["_spts"]),
-                        "delta":    delta,
-                        "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
-                        "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
-                        "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
-                        "team":     team,
-                    })
+            fa_p["_is_rp"] = (fa_p["SV"] > 2) | (fa_p["HLD"] > 5) | (fa_p["IP"] < 70)
+            fa_p["_est"] = fa_p.apply(
+                lambda r: _est_p(float(r["_spts"]),
+                                 float(r["IP"]) if float(r["IP"]) > 0 else float(r["_spts"]),
+                                 bool(r["_is_rp"])), axis=1)
+            p_finalists = (
+                fa_p[fa_p["_est"] > 0]
+                .sort_values("_est", ascending=False)
+                .head(_FINALIST_N)
+                .to_dict("records")
+            )
+
+        # ── Full optimizer on finalists only (~10–20 calls total) ─────────────
+        candidates = []
+        for row in h_finalists:
+            name   = str(row["Name"])
+            fa_row = ctx_obj.fa_hit[ctx_obj.fa_hit["Name"] == name].copy()
+            fa_row["Team"] = team
+            result = _calc_team_spts(team, pd.concat([hf, fa_row], ignore_index=True), pf)
+            delta  = round(result["Total_SPTS"] - base_total, 1)
+            if delta > 0:
+                candidates.append({
+                    "name":     name,
+                    "role":     "H",
+                    "pos":      str(row.get("Pos", "?")),
+                    "salary":   float(row["_sal"]),
+                    "raw_spts": float(row["_spts"]),
+                    "delta":    delta,
+                    "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
+                    "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
+                    "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
+                    "team":     team,
+                })
+        for row in p_finalists:
+            name   = str(row["Name"])
+            role   = "RP" if row["_is_rp"] else "SP"
+            fa_row = ctx_obj.fa_pit[ctx_obj.fa_pit["Name"] == name].copy()
+            fa_row["Team"] = team
+            for col in ("Ros_IP", "Ros_SV", "Ros_HLD"):
+                if col not in fa_row.columns:
+                    fa_row[col] = 0.0
+            result = _calc_team_spts(team, hf, pd.concat([pf, fa_row], ignore_index=True))
+            delta  = round(result["Total_SPTS"] - base_total, 1)
+            if delta > 0:
+                candidates.append({
+                    "name":     name,
+                    "role":     role,
+                    "pos":      role,
+                    "salary":   float(row["_sal"]),
+                    "raw_spts": float(row["_spts"]),
+                    "delta":    delta,
+                    "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
+                    "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
+                    "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
+                    "team":     team,
+                })
 
         candidates.sort(key=lambda c: c["delta"], reverse=True)
         top5 = candidates[:5]
@@ -2440,9 +2508,9 @@ def find_best_fa_pickups(n_clicks, team, sys_val, patch_data):
             }))
 
         footer = html.P(
-            f"Scanned top {_FA_SCAN_CAP} FA hitters + pitchers against {team}'s roster — "
-            f"showing top {len(top5)} of {len(candidates)} positive-delta pickups. "
-            "Click \u2018Apply pickup\u2019 to simulate the addition across all dashboard tabs.",
+            f"Estimated delta for all eligible FAs against {team}'s roster — "
+            f"ran full optimizer on top {_FINALIST_N} hitter + {_FINALIST_N} pitcher candidates. "
+            f"Showing top {len(top5)} of {len(candidates)} positive-delta pickups.",
             style={"color": C_MUTED, "fontSize": "11px",
                    "marginTop": "12px", "textAlign": "center"},
         )

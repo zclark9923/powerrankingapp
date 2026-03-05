@@ -323,10 +323,11 @@ def find_optimal_trades(
     max_players: int = 2,
     top_n: int = 10,
     salary_tol: float = SALARY_TOLERANCE,
-    time_budget: float = 20.0,
+    time_budget: float = 29.0,
     progress_cb=None,
     untouchables_a: list[str] | None = None,
     untouchables_b: list[str] | None = None,
+    _meta: dict | None = None,
 ) -> list[dict]:
     """
     Find the most synergistic trades between team_a and team_b.
@@ -342,6 +343,8 @@ def find_optimal_trades(
     ----------
     untouchables_a : player names on team_a that must not be included in any trade
     untouchables_b : player names on team_b that must not be included in any trade
+    _meta          : optional dict; populated in-place with diagnostic info:
+                     candidates_found, evaluated, timed_out, all_one_sided
 
     Each result dict:
       give_a      – list of player names team_a sends
@@ -354,6 +357,9 @@ def find_optimal_trades(
     max_players = min(max_players, MAX_TRADE_SIZE)
     t0       = time.time()
     deadline = t0 + time_budget
+    if _meta is None:
+        _meta = {}
+    _meta.update(candidates_found=0, evaluated=0, timed_out=False, all_one_sided=False)
 
     def _elapsed() -> float:
         return time.time() - t0
@@ -394,6 +400,7 @@ def find_optimal_trades(
     if not all_candidates:
         return []
 
+    _meta["candidates_found"] = len(all_candidates)
     if progress_cb:
         progress_cb(0.20, f"{len(all_candidates):,} candidates found ({_elapsed():.1f}s)")
 
@@ -421,7 +428,9 @@ def find_optimal_trades(
 
         # Only keep trades where both sides gain (or break even)
         if delta_a < 0 or delta_b < 0:
+            _meta["all_one_sided"] = True   # at least one candidate was one-sided
             continue
+        _meta["all_one_sided"] = False       # reset — we found a winner
 
         scored.append({
             "give_a":        names_a,
@@ -441,6 +450,12 @@ def find_optimal_trades(
         if progress_cb and (i % max(1, n // 20) == 0):
             pct = 0.20 + 0.78 * (i / n)
             progress_cb(pct, f"Exact scored {i+1}/{n}  ({_elapsed():.1f}s)")
+
+    _meta["evaluated"]  = i + 1 if all_candidates else 0
+    _meta["timed_out"]  = time.time() >= deadline
+    # all_one_sided is only meaningful when we scored everything without timing out
+    if _meta["timed_out"]:
+        _meta["all_one_sided"] = False
 
     # ── Rank and return ───────────────────────────────────────────────────────
     scored.sort(key=lambda r: r["total_delta"], reverse=True)

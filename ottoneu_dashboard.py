@@ -2231,15 +2231,19 @@ def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
     n_opps = len(search_teams)
 
     all_results: list[dict] = []
+    agg_meta = {"candidates_found": 0, "evaluated": 0,
+                "timed_out": False, "all_one_sided": False}
     # ── Single global 20-second wall shared across all opponents ─────────────
-    _global_deadline = _time.time() + 20.0
+    _global_deadline = _time.time() + 29.0
 
     for idx, opp in enumerate(search_teams):
         remaining = _global_deadline - _time.time()
         if remaining <= 0:
             _prog(f"Time limit reached \u2014 searched {idx} of {n_opps} opponents")
+            agg_meta["timed_out"] = True
             break
         _prog(f"Searching {opp} ({idx + 1}/{n_opps})\u2026")
+        _opp_meta: dict = {}
 
         # Wire find_optimal_trades progress back to the Dash progress bar
         def _opp_progress(pct, msg, _o=opp, _i=idx):
@@ -2255,16 +2259,40 @@ def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
             progress_cb=_opp_progress,
             untouchables_a=untouchables_a or [],
             untouchables_b=untouchables_b or [],
+            _meta=_opp_meta,
         )
         for r in results:
             r["_opp"] = opp
         all_results.extend(results)
+        # Aggregate metadata across opponents
+        agg_meta["candidates_found"] += _opp_meta.get("candidates_found", 0)
+        agg_meta["evaluated"]        += _opp_meta.get("evaluated", 0)
+        if _opp_meta.get("timed_out"):    agg_meta["timed_out"]    = True
+        if _opp_meta.get("all_one_sided"): agg_meta["all_one_sided"] = True
 
     _prog("Ranking results\u2026")
 
     if not all_results:
-        msg = ("No salary-balanced trades found \u2014 try selecting a specific opponent "
-               "or reducing max players per side.")
+        if agg_meta["timed_out"] and agg_meta["candidates_found"] == 0:
+            msg = ("\u23f1 Time limit reached before any salary-valid trades could be generated. "
+                   "Try: a specific opponent, fewer players per side, or a higher salary tolerance.")
+        elif agg_meta["timed_out"] and agg_meta["evaluated"] == 0:
+            msg = ("\u23f1 Time limit reached during candidate generation \u2014 no exact scoring was done. "
+                   "Try: a specific opponent or fewer players per side.")
+        elif agg_meta["timed_out"]:
+            msg = (f"\u23f1 Time limit reached after scoring {agg_meta['evaluated']} candidates \u2014 "
+                   "all were one-sided within the time budget. "
+                   "Try a higher salary tolerance or fewer players per side.")
+        elif agg_meta["candidates_found"] == 0:
+            msg = ("No salary-valid trade combinations found. "
+                   "Try raising the salary differential or removing untouchables.")
+        elif agg_meta["all_one_sided"]:
+            msg = (f"Found {agg_meta['evaluated']} salary-balanced combinations but none "
+                   "benefit both teams simultaneously. "
+                   "Try raising the salary tolerance or selecting a different opponent.")
+        else:
+            msg = ("No mutually beneficial trades found \u2014 try a specific opponent, "
+                   "more players per side, or a higher salary tolerance.")
         return (html.P(msg, style={"color": C_MUTED, "textAlign": "center",
                                    "marginTop": "20px"}), [])
 

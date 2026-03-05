@@ -1841,11 +1841,21 @@ def _build_patched_ctx(base_ctx: SysCtx, patch: dict) -> SysCtx:
 
 
 def _get_ctx(sys_val: str, patch_data) -> SysCtx:
-    """Return base context, or a fully recomputed patched context if a trade is active."""
+    """
+    Return the base context, or a fully recomputed patched context that applies
+    every entry in patch_data (a list of patch dicts) sequentially.
+    Supports the legacy single-dict format for backward compatibility.
+    """
     base = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
-    if not patch_data or patch_data.get("sys") != sys_val:
+    if not patch_data:
         return base
-    return _build_patched_ctx(base, patch_data)
+    # Normalise: legacy callers may pass a single dict
+    patches = patch_data if isinstance(patch_data, list) else [patch_data]
+    ctx = base
+    for p in patches:
+        if isinstance(p, dict) and p.get("sys") == sys_val:
+            ctx = _build_patched_ctx(ctx, p)
+    return ctx
 
 
 _FA_POOL_LIMIT = 150   # max FA players shown in the picker (already sorted by SPTS)
@@ -2091,11 +2101,12 @@ _FA_SHOW = {}
     Output("trade-drop-a",    "options"),
     Output("trade-drop-a",    "value"),
     Output("trade-drop-wrap-a", "style"),
-    Input("trade-team-a", "value"),
+    Input("trade-team-a",      "value"),
     Input("proj-system-radio", "value"),
+    State("trade-patch-store", "data"),
 )
-def populate_trade_a(team_a, sys_val):
-    ctx  = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+def populate_trade_a(team_a, sys_val, patch_data):
+    ctx  = _get_ctx(sys_val, patch_data)
     opts = _trade_player_options(team_a, ctx)
     is_fa = (team_a == _FA_TEAM)
     label = _FA_LABEL_RECV if is_fa else _FA_LABEL_SEND
@@ -2110,11 +2121,12 @@ def populate_trade_a(team_a, sys_val):
     Output("trade-drop-b",    "options"),
     Output("trade-drop-b",    "value"),
     Output("trade-drop-wrap-b", "style"),
-    Input("trade-team-b", "value"),
+    Input("trade-team-b",      "value"),
     Input("proj-system-radio", "value"),
+    State("trade-patch-store", "data"),
 )
-def populate_trade_b(team_b, sys_val):
-    ctx  = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+def populate_trade_b(team_b, sys_val, patch_data):
+    ctx  = _get_ctx(sys_val, patch_data)
     opts = _trade_player_options(team_b, ctx)
     is_fa = (team_b == _FA_TEAM)
     label = _FA_LABEL_RECV if is_fa else _FA_LABEL_SEND
@@ -2158,9 +2170,10 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
     if team_a == _FA_TEAM and team_b == _FA_TEAM:
         return html.P("At least one side must be a real team.", style={"color": C_MUTED}), _no_store
 
-    base_ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+    # Build on top of whatever changes are already active
+    current_ctx = _get_ctx(sys_val, patch_data)
 
-    if base_ctx.hit_full.empty or base_ctx.pit_full.empty:
+    if current_ctx.hit_full.empty or current_ctx.pit_full.empty:
         return html.P(
             "Trade machine needs updated data — re-run ottoneu_power_rankings.py "
             "to regenerate the workbook, then redeploy.",
@@ -2174,7 +2187,7 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 
     result = _evaluate_trade_logic(
         team_a, players_a, drop_a,
-        team_b, players_b, drop_b, base_ctx)
+        team_b, players_b, drop_b, current_ctx)
 
     if result is None:
         return html.P("Could not evaluate trade.", style={"color": C_MUTED}), _no_store
@@ -2193,12 +2206,15 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
         _drop_all = drop_a + drop_b
         _label = f"Drop: {', '.join(_drop_all)}" if _drop_all else "Roster change"
 
-    patch = {
+    new_patch = {
         "sys":      sys_val,
         "team_a":   team_a,   "players_a": players_a, "drop_a": drop_a,
         "team_b":   team_b,   "players_b": players_b, "drop_b": drop_b,
         "label":    _label,
     }
+    # Append to the running list of changes
+    existing = patch_data if isinstance(patch_data, list) else ([patch_data] if patch_data else [])
+    updated_patches = existing + [new_patch]
 
     cards = []
     accents = {team_a: C_HIT, team_b: C_RP}
@@ -2215,13 +2231,16 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
             accents.get(team, C_SP),
         ))
 
+    n_total = len(updated_patches)
     return html.Div([
         html.Div(cards, style={"display": "flex", "gap": "16px", "alignItems": "stretch"}),
-        html.P("Rankings re-computed across the full league with the modified rosters. "
-               "All other dashboard tabs now reflect these simulated rosters.",
-               style={"color": C_MUTED, "fontSize": "11px",
-                      "marginTop": "12px", "textAlign": "center"}),
-    ]), patch
+        html.P(
+            f"Change #{n_total} added. Rankings re-computed on top of all {n_total} "
+            "simulated change(s). All other dashboard tabs reflect these rosters.",
+            style={"color": C_MUTED, "fontSize": "11px",
+                   "marginTop": "12px", "textAlign": "center"},
+        ),
+    ]), updated_patches
 
 
 # ── Active-trade banner ────────────────────────────────────────────────────────────────
@@ -2720,16 +2739,17 @@ else:
             return _opt_error_output(exc)
 
 
-# Apply-trade button from optimizer results → sets trade-patch-store
+# Apply-trade button from optimizer results → appends to trade-patch-store
 @app.callback(
     Output("trade-patch-store", "data", allow_duplicate=True),
     Input({"type": "opt-apply-btn", "index": ALL}, "n_clicks"),
     State("opt-team-a",        "value"),
     State("opt-results-store", "data"),
     State("proj-system-radio", "value"),
+    State("trade-patch-store", "data"),
     prevent_initial_call=True,
 )
-def apply_optimizer_trade(n_clicks_list, team_a, stored_results, sys_val):
+def apply_optimizer_trade(n_clicks_list, team_a, stored_results, sys_val, patch_data):
     """Read the pre-computed results from opt-results-store and apply the clicked trade."""
     if not any(n for n in (n_clicks_list or []) if n):
         raise PreventUpdate
@@ -2745,7 +2765,7 @@ def apply_optimizer_trade(n_clicks_list, team_a, stored_results, sys_val):
         raise PreventUpdate
 
     r = stored_results[clicked_index]
-    return {
+    new_patch = {
         "sys":       sys_val,
         "team_a":    team_a,
         "players_a": r["give_a"],
@@ -2757,6 +2777,8 @@ def apply_optimizer_trade(n_clicks_list, team_a, stored_results, sys_val):
                       f"{', '.join(r['give_a'])} "
                       f"\u2194 {r['_opp']} gives {', '.join(r['give_b'])}"),
     }
+    existing = patch_data if isinstance(patch_data, list) else ([patch_data] if patch_data else [])
+    return existing + [new_patch]
 
 
 # ── Active-trade banner ────────────────────────────────────────────────────────────────
@@ -2768,13 +2790,35 @@ def apply_optimizer_trade(n_clicks_list, team_a, stored_results, sys_val):
 def update_trade_banner(patch_data):
     if not patch_data:
         return html.Div()
-    label = patch_data.get("label", "Roster change active")
+    patches = patch_data if isinstance(patch_data, list) else [patch_data]
+    patches = [p for p in patches if isinstance(p, dict)]
+    if not patches:
+        return html.Div()
+    n = len(patches)
+    rows = [
+        html.Div([
+            html.Span(f"{i}.",
+                      style={"color": "#F59E0B", "fontWeight": "700",
+                             "minWidth": "20px", "flexShrink": "0"}),
+            html.Span(p.get("label", "Roster change"),
+                      style={"color": C_TEXT}),
+        ], style={"display": "flex", "gap": "6px", "marginBottom": "2px"})
+        for i, p in enumerate(patches, 1)
+    ]
     return html.Div([
-        html.Span("⚠️ SIMULATED ROSTERS ACTIVE — ",
-                  style={"fontWeight": "700", "color": "#F59E0B"}),
-        html.Span(label, style={"color": C_TEXT}),
-        html.Span("  ·  Go to Trade Machine and click Reset to restore live rosters.",
-                  style={"color": C_MUTED, "fontSize": "12px"}),
+        html.Div([
+            html.Span(
+                f"\u26a0\ufe0f {n} SIMULATED CHANGE{'S' if n > 1 else ''} ACTIVE",
+                style={"fontWeight": "700", "color": "#F59E0B"},
+            ),
+            html.Span(
+                "  \u00b7  Go to Trade Machine and click Reset to restore live rosters.",
+                style={"color": C_MUTED, "fontSize": "12px"},
+            ),
+        ], style={"marginBottom": "6px" if n > 1 else "0"}),
+        html.Div(rows) if n > 1 else html.Span(
+            patches[0].get("label", "Roster change"), style={"color": C_TEXT}
+        ),
     ], style={
         "background": "#1E293B", "border": "1px solid #F59E0B",
         "borderRadius": "8px", "padding": "10px 16px",

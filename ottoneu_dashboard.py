@@ -1092,6 +1092,7 @@ app.layout = html.Div(className="page-wrap", style={
     html.Div(id="trade-active-banner", style={"marginBottom": "0"}),
 
     dcc.Store(id="trade-patch-store", storage_type="session"),
+    dcc.Store(id="opt-results-store",  storage_type="memory"),
 
     dcc.Tabs(id="main-tabs", value="rankings",
              style={"marginBottom": "24px"},
@@ -2083,7 +2084,8 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 
 
 @app.callback(
-    Output("opt-results", "children"),
+    Output("opt-results",       "children"),
+    Output("opt-results-store", "data"),
     Input("opt-run-btn", "n_clicks"),
     State("opt-team-a",      "value"),
     State("opt-team-b",      "value"),
@@ -2094,7 +2096,7 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 )
 def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_data):
     if not n_clicks:
-        return html.Div()
+        return html.Div(), []
 
     ctx_obj = _get_ctx(sys_val, patch_data)
     hf = ctx_obj.hit_full.copy()
@@ -2118,8 +2120,9 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
         all_results.extend(results)
 
     if not all_results:
-        return html.P("No salary-balanced trades found.",
-                      style={"color": C_MUTED, "textAlign": "center", "marginTop": "20px"})
+        return (html.P("No salary-balanced trades found.",
+                       style={"color": C_MUTED, "textAlign": "center", "marginTop": "20px"}),
+                [])
 
     all_results.sort(key=lambda r: r["total_delta"], reverse=True)
     top = all_results[:15]
@@ -2131,23 +2134,11 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
     def _color(v):
         return C_HIT if v > 0 else (C_RP if v < 0 else C_MUTED)
 
-    def _apply_btn(rank, r):
-        patch = {
-            "sys":       sys_val,
-            "team_a":    team_a,
-            "players_a": r["give_a"],
-            "drop_a":    [],
-            "team_b":    r["_opp"],
-            "players_b": r["give_b"],
-            "drop_b":    [],
-            "label":     (f"Optimizer #{rank}: {team_a} gives {', '.join(r['give_a'])} "
-                          f"↔ {r['_opp']} gives {', '.join(r['give_b'])}"),
-        }
+    def _apply_btn(rank):
         return html.Button(
             "Apply",
             id={"type": "opt-apply-btn", "index": rank},
             n_clicks=0,
-            **{"data-patch": str(patch)},
             style={
                 "background": "transparent", "color": C_HIT,
                 "border": f"1px solid {C_HIT}", "borderRadius": "6px",
@@ -2183,7 +2174,7 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
             html.Td(f"${r['sal_a']:.0f} / ${r['sal_b']:.0f}",
                     style={"color": C_MUTED, "fontSize": "11px", "padding": "10px 8px",
                            "textAlign": "center"}),
-            html.Td(_apply_btn(i, r), style={"padding": "10px 8px", "textAlign": "center"}),
+            html.Td(_apply_btn(i), style={"padding": "10px 8px", "textAlign": "center"}),
         ], style={"borderBottom": f"1px solid {C_GRID}",
                   "background": C_CARD if i % 2 else "#253045"}))
 
@@ -2231,7 +2222,17 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
         style={"width": "100%", "borderCollapse": "collapse"},
     )
 
-    return html.Div([
+    # Serialise top for the store (only the fields the apply callback needs)
+    store_data = [
+        {
+            "give_a": r["give_a"],
+            "give_b": r["give_b"],
+            "_opp":   r["_opp"],
+        }
+        for r in top
+    ]
+
+    return (html.Div([
         html.P(
             f"Top {len(top)} trades (sorted by total SPTS synergy)  \u00b7  "
             f"Salary tolerance \u00b1$3  \u00b7  Click \u2018Apply\u2019 to simulate on the full dashboard",
@@ -2241,7 +2242,7 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
             "background": C_CARD, "borderRadius": "12px",
             "padding": "4px", "overflowX": "auto",
         }),
-    ])
+    ]), store_data)
 
 
 # Apply-trade button from optimizer results → sets trade-patch-store
@@ -2249,49 +2250,26 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
     Output("trade-patch-store", "data", allow_duplicate=True),
     Input({"type": "opt-apply-btn", "index": ALL}, "n_clicks"),
     State("opt-team-a",        "value"),
-    State("opt-team-b",        "value"),
-    State("opt-results",       "children"),
+    State("opt-results-store", "data"),
     State("proj-system-radio", "value"),
-    State("trade-patch-store", "data"),
     prevent_initial_call=True,
 )
-def apply_optimizer_trade(n_clicks_list, team_a, team_b, _results, sys_val, patch_data):
-    """
-    Because the Apply buttons in the table carry the patch data as a data attribute
-    we can't easily pass it through Dash callbacks. Instead we re-run find_optimal_trades
-    for just the clicked rank.  The click cost is cheap since it's a single combo.
-    """
+def apply_optimizer_trade(n_clicks_list, team_a, stored_results, sys_val):
+    """Read the pre-computed results from opt-results-store and apply the clicked trade."""
     if not any(n for n in (n_clicks_list or []) if n):
         raise PreventUpdate
 
-    clicked_index = next(
-        (i for i, n in enumerate(n_clicks_list or []) if n),
-        None,
-    )
-    if clicked_index is None:
+    triggered = dash_ctx.triggered_id
+    if not triggered or not isinstance(triggered, dict):
         raise PreventUpdate
 
-    ctx_obj = _get_ctx(sys_val, patch_data)
-    hf = ctx_obj.hit_full.copy()
-    pf = ctx_obj.pit_full.copy()
+    # index is 1-based (rank), convert to 0-based list index
+    clicked_index = int(triggered["index"]) - 1
 
-    search_teams = [t for t in teams if t != team_a] if team_b == "__ANY__" else [team_b]
-    all_results: list[dict] = []
-    for opp in search_teams:
-        res = find_optimal_trades(team_a, opp, hf, pf,
-                                  summary=ctx_obj.summary,
-                                  max_players=2, top_n=10)
-        for r in res:
-            r["_opp"] = opp
-        all_results.extend(res)
-
-    all_results.sort(key=lambda r: r["total_delta"], reverse=True)
-    top = all_results[:15]
-
-    if clicked_index >= len(top):
+    if not stored_results or clicked_index >= len(stored_results):
         raise PreventUpdate
 
-    r = top[clicked_index]
+    r = stored_results[clicked_index]
     return {
         "sys":       sys_val,
         "team_a":    team_a,

@@ -23,9 +23,16 @@ from pathlib import Path
 from ottoneu_power_rankings import optimal_lineup_spts, constrained_pitcher_spts, recompute_from_rosters
 from trade_optimizer import find_optimal_trades
 
-# Background callback manager (lets optimizer run past Render's 30s HTTP timeout)
-_cache = diskcache.Cache("/tmp/dash_optimizer_cache")
-background_callback_manager = DiskcacheManager(_cache)
+# Background callback manager — initialised once, safely, after gunicorn has
+# forked its workers (wrapped in try/except so a failure doesn't crash startup).
+try:
+    _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dash_cache")
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    _cache = diskcache.Cache(_CACHE_DIR)
+    background_callback_manager = DiskcacheManager(_cache)
+except Exception as _bcm_err:  # noqa: BLE001
+    background_callback_manager = None
+    print(f"[WARN] Background callback manager unavailable: {_bcm_err}")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Relative path so the app works both locally and when deployed
@@ -1053,6 +1060,10 @@ _TAB_SEL = {
 app = Dash(__name__, title="Ottoneu Power Rankings",
           background_callback_manager=background_callback_manager,
           meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
+
+# Warn in logs if background callbacks aren't available
+if background_callback_manager is None:
+    print("[WARN] Optimizer will use sync callback — may hit Render 30s timeout on 'Any Team' searches.")
 
 app.layout = html.Div(className="page-wrap", style={
     "background": C_BG, "minHeight": "100vh",
@@ -2108,83 +2119,47 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 # ── Active-trade banner ────────────────────────────────────────────────────────────────
 
 # ── Trade Optimizer callback ──────────────────────────────────────────────────
+# Shared computation + table-building logic used by both callback variants.
 
+def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
+                        set_progress=None):
+    """Run the optimizer and return (children, store_data)."""
+    def _prog(msg):
+        if set_progress:
+            set_progress(msg)
 
-@app.callback(
-    output=[
-        Output("opt-results",       "children"),
-        Output("opt-results-store", "data"),
-    ],
-    inputs=[
-        Input("opt-run-btn", "n_clicks"),
-        State("opt-team-a",        "value"),
-        State("opt-team-b",        "value"),
-        State("opt-max-players",   "value"),
-        State("proj-system-radio", "value"),
-        State("trade-patch-store", "data"),
-    ],
-    background=True,
-    running=[
-        (Output("opt-run-btn",      "disabled"), True,  False),
-        (Output("opt-cancel-btn",   "disabled"), False, True),
-        (Output("opt-progress-div", "style"),
-         {"display": "block", "marginBottom": "12px"},
-         {"display": "none"}),
-    ],
-    cancel=[Input("opt-cancel-btn", "n_clicks")],
-    progress=Output("opt-progress-msg", "children"),
-    prevent_initial_call=True,
-)
-def run_trade_optimizer(set_progress, n_clicks, team_a, team_b, max_players, sys_val, patch_data):
-    if not n_clicks:
-        return html.Div(), []
+    ctx_obj = _get_ctx(sys_val, patch_data)
+    hf = ctx_obj.hit_full.copy()
+    pf = ctx_obj.pit_full.copy()
 
-    try:
-        ctx_obj = _get_ctx(sys_val, patch_data)
-        hf = ctx_obj.hit_full.copy()
-        pf = ctx_obj.pit_full.copy()
+    all_teams = [t for t in teams if t != team_a]
+    search_teams = all_teams if team_b == "__ANY__" else [team_b]
+    n_opps = len(search_teams)
 
-        all_teams = [t for t in teams if t != team_a]
-        search_teams = all_teams if team_b == "__ANY__" else [team_b]
+    all_results: list[dict] = []
+    for idx, opp in enumerate(search_teams):
+        _prog(f"Searching {opp} ({idx + 1}/{n_opps})\u2026")
+        results = find_optimal_trades(
+            team_a, opp, hf, pf,
+            summary=ctx_obj.summary,
+            max_players=max_players,
+            top_n=10,
+        )
+        for r in results:
+            r["_opp"] = opp
+        all_results.extend(results)
 
-        all_results: list[dict] = []
-        n_opps = len(search_teams)
+    _prog("Ranking results\u2026")
 
-        for idx, opp in enumerate(search_teams):
-            set_progress(f"Searching {opp} ({idx + 1}/{n_opps})…")
-            results = find_optimal_trades(
-                team_a, opp, hf, pf,
-                summary=ctx_obj.summary,
-                max_players=max_players,
-                top_n=10,
-            )
-            for r in results:
-                r["_opp"] = opp
-            all_results.extend(results)
+    if not all_results:
+        msg = ("No salary-balanced trades found \u2014 try selecting a specific opponent "
+               "or reducing max players per side.")
+        return (html.P(msg, style={"color": C_MUTED, "textAlign": "center",
+                                   "marginTop": "20px"}), [])
 
-        set_progress("Ranking results…")
+    all_results.sort(key=lambda r: r["total_delta"], reverse=True)
+    top = all_results[:15]
 
-        if not all_results:
-            msg = ("No salary-balanced trades found — try relaxing the max players setting "
-                   "or selecting a specific opponent team.")
-            return (html.P(msg, style={"color": C_MUTED, "textAlign": "center",
-                                       "marginTop": "20px"}), [])
-
-        all_results.sort(key=lambda r: r["total_delta"], reverse=True)
-        top = all_results[:15]
-
-    except Exception as exc:
-        return (html.Div([
-            html.P("⚠ Optimizer error — see details below.",
-                   style={"color": "#F87171", "fontWeight": "700", "marginBottom": "8px"}),
-            html.Pre(str(exc),
-                     style={"color": C_MUTED, "fontSize": "11px",
-                            "whiteSpace": "pre-wrap", "wordBreak": "break-all"}),
-        ], style={"background": C_CARD, "borderRadius": "8px",
-                  "padding": "16px", "marginTop": "16px"}),
-        [])
-
-    # Build results table
     def _sign(v):
         return f"+{v:.1f}" if v >= 0 else f"{v:.1f}"
 
@@ -2236,58 +2211,23 @@ def run_trade_optimizer(set_progress, n_clicks, team_a, team_b, max_players, sys
                   "background": C_CARD if i % 2 else "#253045"}))
 
     header = html.Tr([
-        html.Th("", style={"padding": "8px", "color": C_MUTED,
-                            "fontSize": "11px", "textTransform": "uppercase",
-                            "letterSpacing": "0.06em", "borderBottom": f"2px solid {C_GRID}"}),
-        html.Th(f"{team_a} gives", style={"padding": "8px", "color": C_HIT,
-                                          "fontSize": "11px", "textTransform": "uppercase",
-                                          "letterSpacing": "0.06em",
-                                          "borderBottom": f"2px solid {C_GRID}"}),
-        html.Th(f"Δ {team_a}", style={"padding": "8px", "color": C_HIT,
-                                      "fontSize": "11px", "textTransform": "uppercase",
-                                      "letterSpacing": "0.06em", "textAlign": "center",
-                                      "borderBottom": f"2px solid {C_GRID}"}),
-        html.Th("Opponent", style={"padding": "8px", "color": C_MUTED,
-                                   "fontSize": "11px", "textTransform": "uppercase",
-                                   "letterSpacing": "0.06em",
-                                   "borderBottom": f"2px solid {C_GRID}"}),
-        html.Th("Opponent gives", style={"padding": "8px", "color": C_RP,
-                                         "fontSize": "11px", "textTransform": "uppercase",
-                                         "letterSpacing": "0.06em",
-                                         "borderBottom": f"2px solid {C_GRID}"}),
-        html.Th("Δ Opponent", style={"padding": "8px", "color": C_RP,
-                                     "fontSize": "11px", "textTransform": "uppercase",
-                                     "letterSpacing": "0.06em", "textAlign": "center",
-                                     "borderBottom": f"2px solid {C_GRID}"}),
-        html.Th("Δ Total", style={"padding": "8px", "color": C_TEXT,
-                                  "fontSize": "11px", "textTransform": "uppercase",
-                                  "letterSpacing": "0.06em", "textAlign": "center",
-                                  "borderLeft": f"2px solid {C_GRID}",
-                                  "borderBottom": f"2px solid {C_GRID}"}),
-        html.Th("Salaries", style={"padding": "8px", "color": C_MUTED,
-                                   "fontSize": "11px", "textTransform": "uppercase",
-                                   "letterSpacing": "0.06em", "textAlign": "center",
-                                   "borderBottom": f"2px solid {C_GRID}"}),
-        html.Th("Apply", style={"padding": "8px", "color": C_MUTED,
-                                "fontSize": "11px", "textTransform": "uppercase",
-                                "letterSpacing": "0.06em", "textAlign": "center",
-                                "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("",                  style={"padding": "8px", "color": C_MUTED,   "fontSize": "11px", "textTransform": "uppercase", "letterSpacing": "0.06em", "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th(f"{team_a} gives",  style={"padding": "8px", "color": C_HIT,     "fontSize": "11px", "textTransform": "uppercase", "letterSpacing": "0.06em", "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th(f"\u0394 {team_a}", style={"padding": "8px", "color": C_HIT,     "fontSize": "11px", "textTransform": "uppercase", "letterSpacing": "0.06em", "textAlign": "center", "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Opponent",          style={"padding": "8px", "color": C_MUTED,   "fontSize": "11px", "textTransform": "uppercase", "letterSpacing": "0.06em", "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Opponent gives",    style={"padding": "8px", "color": C_RP,      "fontSize": "11px", "textTransform": "uppercase", "letterSpacing": "0.06em", "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("\u0394 Opponent",   style={"padding": "8px", "color": C_RP,      "fontSize": "11px", "textTransform": "uppercase", "letterSpacing": "0.06em", "textAlign": "center", "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("\u0394 Total",      style={"padding": "8px", "color": C_TEXT,    "fontSize": "11px", "textTransform": "uppercase", "letterSpacing": "0.06em", "textAlign": "center", "borderLeft": f"2px solid {C_GRID}", "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Salaries",          style={"padding": "8px", "color": C_MUTED,   "fontSize": "11px", "textTransform": "uppercase", "letterSpacing": "0.06em", "textAlign": "center", "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Apply",             style={"padding": "8px", "color": C_MUTED,   "fontSize": "11px", "textTransform": "uppercase", "letterSpacing": "0.06em", "textAlign": "center", "borderBottom": f"2px solid {C_GRID}"}),
     ])
 
     table = html.Table(
         [html.Thead(header), html.Tbody(rows)],
         style={"width": "100%", "borderCollapse": "collapse"},
     )
-
-    # Serialise top for the store (only the fields the apply callback needs)
-    store_data = [
-        {
-            "give_a": r["give_a"],
-            "give_b": r["give_b"],
-            "_opp":   r["_opp"],
-        }
-        for r in top
-    ]
+    store_data = [{"give_a": r["give_a"], "give_b": r["give_b"], "_opp": r["_opp"]}
+                  for r in top]
 
     return (html.Div([
         html.P(
@@ -2300,6 +2240,78 @@ def run_trade_optimizer(set_progress, n_clicks, team_a, team_b, max_players, sys
             "padding": "4px", "overflowX": "auto",
         }),
     ]), store_data)
+
+
+def _opt_error_output(exc):
+    return (html.Div([
+        html.P("\u26a0 Optimizer error \u2014 see details below.",
+               style={"color": "#F87171", "fontWeight": "700", "marginBottom": "8px"}),
+        html.Pre(str(exc),
+                 style={"color": C_MUTED, "fontSize": "11px",
+                        "whiteSpace": "pre-wrap", "wordBreak": "break-all"}),
+    ], style={"background": C_CARD, "borderRadius": "8px",
+              "padding": "16px", "marginTop": "16px"}), [])
+
+
+# ── Register callback: background version (if DiskcacheManager available) ────
+if background_callback_manager is not None:
+    @app.callback(
+        output=[
+            Output("opt-results",       "children"),
+            Output("opt-results-store", "data"),
+        ],
+        inputs=[
+            Input("opt-run-btn",       "n_clicks"),
+            State("opt-team-a",        "value"),
+            State("opt-team-b",        "value"),
+            State("opt-max-players",   "value"),
+            State("proj-system-radio", "value"),
+            State("trade-patch-store", "data"),
+        ],
+        background=True,
+        running=[
+            (Output("opt-run-btn",      "disabled"), True,  False),
+            (Output("opt-cancel-btn",   "disabled"), False, True),
+            (Output("opt-progress-div", "style"),
+             {"display": "block", "marginBottom": "12px"},
+             {"display": "none"}),
+        ],
+        cancel=[Input("opt-cancel-btn", "n_clicks")],
+        progress=Output("opt-progress-msg", "children"),
+        prevent_initial_call=True,
+    )
+    def run_trade_optimizer_bg(set_progress, n_clicks, team_a, team_b,
+                               max_players, sys_val, patch_data):
+        if not n_clicks:
+            return html.Div(), []
+        try:
+            return _run_optimizer_core(team_a, team_b, max_players,
+                                       sys_val, patch_data, set_progress)
+        except Exception as exc:
+            return _opt_error_output(exc)
+
+# ── Register callback: sync fallback (no background manager) ─────────────────
+else:
+    @app.callback(
+        Output("opt-results",       "children"),
+        Output("opt-results-store", "data"),
+        Input("opt-run-btn",       "n_clicks"),
+        State("opt-team-a",        "value"),
+        State("opt-team-b",        "value"),
+        State("opt-max-players",   "value"),
+        State("proj-system-radio", "value"),
+        State("trade-patch-store", "data"),
+        prevent_initial_call=True,
+    )
+    def run_trade_optimizer_sync(n_clicks, team_a, team_b, max_players,
+                                 sys_val, patch_data):
+        if not n_clicks:
+            return html.Div(), []
+        try:
+            return _run_optimizer_core(team_a, team_b, max_players,
+                                       sys_val, patch_data)
+        except Exception as exc:
+            return _opt_error_output(exc)
 
 
 # Apply-trade button from optimizer results → sets trade-patch-store

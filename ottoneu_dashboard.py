@@ -19,6 +19,7 @@ import plotly.express as px
 from dash import Dash, dcc, html, Input, Output, State, dash_table, ctx as dash_ctx
 from pathlib import Path
 from ottoneu_power_rankings import optimal_lineup_spts, constrained_pitcher_spts, recompute_from_rosters
+from trade_optimizer import find_optimal_trades
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Relative path so the app works both locally and when deployed
@@ -1315,6 +1316,91 @@ app.layout = html.Div(className="page-wrap", style={
 
             html.Div(id="trade-result"),
         ]),
+
+        # ── Tab 5: Trade Optimizer ────────────────────────────────────────────
+        dcc.Tab(label="Trade Optimizer", value="optimizer",
+                style=_TAB_STYLE, selected_style=_TAB_SEL,
+                children=[
+
+            html.P(
+                "Find the most synergistic trades between two teams. "
+                "The optimizer runs the full lineup + pitching solver on every "
+                "salary-valid player combination to surface trades where both sides gain.",
+                style={"color": C_MUTED, "fontSize": "13px", "marginBottom": "20px"},
+            ),
+
+            # Controls row
+            html.Div([
+
+                html.Div([
+                    html.Label("Your Team",
+                               style={"color": C_MUTED, "fontSize": "12px",
+                                      "marginBottom": "4px", "display": "block"}),
+                    dcc.Dropdown(
+                        id="opt-team-a",
+                        options=[{"label": t, "value": t} for t in teams],
+                        value=teams[0], clearable=False,
+                        style={"color": "#0F172A"},
+                    ),
+                ], style={"flex": "1"}),
+
+                html.Div([
+                    html.Label("Trade With",
+                               style={"color": C_MUTED, "fontSize": "12px",
+                                      "marginBottom": "4px", "display": "block"}),
+                    dcc.Dropdown(
+                        id="opt-team-b",
+                        options=[{"label": "— Any Team —", "value": "__ANY__"}] +
+                                [{"label": t, "value": t} for t in teams],
+                        value="__ANY__", clearable=False,
+                        style={"color": "#0F172A"},
+                    ),
+                ], style={"flex": "1"}),
+
+                html.Div([
+                    html.Label("Max players per side",
+                               style={"color": C_MUTED, "fontSize": "12px",
+                                      "marginBottom": "4px", "display": "block"}),
+                    dcc.RadioItems(
+                        id="opt-max-players",
+                        options=[{"label": "1", "value": 1},
+                                 {"label": "2", "value": 2},
+                                 {"label": "3", "value": 3}],
+                        value=2,
+                        inline=True,
+                        inputStyle={"marginRight": "4px"},
+                        labelStyle={"marginRight": "16px",
+                                    "color": C_TEXT, "fontSize": "13px"},
+                    ),
+                ], style={"flex": "none", "minWidth": "180px"}),
+
+                html.Div([
+                    html.Label("\u00a0", style={"display": "block", "marginBottom": "4px"}),
+                    html.Button(
+                        "Find Optimal Trades",
+                        id="opt-run-btn", n_clicks=0,
+                        style={
+                            "background": C_HIT, "color": "#fff",
+                            "border": "none", "borderRadius": "8px",
+                            "padding": "10px 22px", "fontSize": "13px",
+                            "fontWeight": "700", "cursor": "pointer",
+                            "whiteSpace": "nowrap",
+                        },
+                    ),
+                ], style={"flex": "none"}),
+
+            ], style={"display": "flex", "gap": "16px", "alignItems": "flex-end",
+                      "background": C_CARD, "borderRadius": "12px",
+                      "padding": "20px", "marginBottom": "24px"}),
+
+            # Results
+            dcc.Loading(
+                id="opt-loading",
+                type="dot",
+                color=C_HIT,
+                children=html.Div(id="opt-results"),
+            ),
+        ]),
     ]),
 ])
 
@@ -1988,6 +2074,235 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
                style={"color": C_MUTED, "fontSize": "11px",
                       "marginTop": "12px", "textAlign": "center"}),
     ]), patch
+
+
+# ── Active-trade banner ────────────────────────────────────────────────────────────────
+
+# ── Trade Optimizer callback ──────────────────────────────────────────────────
+
+
+@app.callback(
+    Output("opt-results", "children"),
+    Input("opt-run-btn", "n_clicks"),
+    State("opt-team-a",      "value"),
+    State("opt-team-b",      "value"),
+    State("opt-max-players", "value"),
+    State("proj-system-radio", "value"),
+    State("trade-patch-store", "data"),
+    prevent_initial_call=True,
+)
+def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_data):
+    if not n_clicks:
+        return html.Div()
+
+    ctx_obj = _get_ctx(sys_val, patch_data)
+    hf = ctx_obj.hit_full.copy()
+    pf = ctx_obj.pit_full.copy()
+
+    # Determine which teams to search against
+    all_teams = [t for t in teams if t != team_a]
+    search_teams = all_teams if team_b == "__ANY__" else [team_b]
+
+    all_results: list[dict] = []
+
+    for opp in search_teams:
+        results = find_optimal_trades(
+            team_a, opp, hf, pf,
+            summary=ctx_obj.summary,
+            max_players=max_players,
+            top_n=10,
+        )
+        for r in results:
+            r["_opp"] = opp
+        all_results.extend(results)
+
+    if not all_results:
+        return html.P("No salary-balanced trades found.",
+                      style={"color": C_MUTED, "textAlign": "center", "marginTop": "20px"})
+
+    all_results.sort(key=lambda r: r["total_delta"], reverse=True)
+    top = all_results[:15]
+
+    # Build results table
+    def _sign(v):
+        return f"+{v:.1f}" if v >= 0 else f"{v:.1f}"
+
+    def _color(v):
+        return C_HIT if v > 0 else (C_RP if v < 0 else C_MUTED)
+
+    def _apply_btn(rank, r):
+        patch = {
+            "sys":       sys_val,
+            "team_a":    team_a,
+            "players_a": r["give_a"],
+            "drop_a":    [],
+            "team_b":    r["_opp"],
+            "players_b": r["give_b"],
+            "drop_b":    [],
+            "label":     (f"Optimizer #{rank}: {team_a} gives {', '.join(r['give_a'])} "
+                          f"↔ {r['_opp']} gives {', '.join(r['give_b'])}"),
+        }
+        return html.Button(
+            "Apply",
+            id={"type": "opt-apply-btn", "index": rank},
+            n_clicks=0,
+            **{"data-patch": str(patch)},
+            style={
+                "background": "transparent", "color": C_HIT,
+                "border": f"1px solid {C_HIT}", "borderRadius": "6px",
+                "padding": "4px 12px", "fontSize": "11px",
+                "cursor": "pointer", "whiteSpace": "nowrap",
+            },
+        )
+
+    rows = []
+    for i, r in enumerate(top, 1):
+        rows.append(html.Tr([
+            html.Td(f"#{i}", style={"color": C_MUTED, "fontSize": "12px",
+                                    "padding": "10px 8px", "whiteSpace": "nowrap"}),
+            html.Td(", ".join(r["give_a"]),
+                    style={"color": C_TEXT, "fontSize": "12px", "padding": "10px 8px"}),
+            html.Td(html.Span(_sign(r["delta_a"]),
+                              style={"color": _color(r["delta_a"]),
+                                     "fontWeight": "700", "fontSize": "13px"}),
+                    style={"padding": "10px 8px", "textAlign": "center"}),
+            html.Td(r["_opp"], style={"color": C_MUTED, "fontSize": "11px",
+                                      "padding": "10px 8px"}),
+            html.Td(", ".join(r["give_b"]),
+                    style={"color": C_TEXT, "fontSize": "12px", "padding": "10px 8px"}),
+            html.Td(html.Span(_sign(r["delta_b"]),
+                              style={"color": _color(r["delta_b"]),
+                                     "fontWeight": "700", "fontSize": "13px"}),
+                    style={"padding": "10px 8px", "textAlign": "center"}),
+            html.Td(html.Span(_sign(r["total_delta"]),
+                              style={"color": _color(r["total_delta"]),
+                                     "fontWeight": "800", "fontSize": "14px"}),
+                    style={"padding": "10px 8px", "textAlign": "center",
+                           "borderLeft": f"2px solid {C_GRID}"}),
+            html.Td(f"${r['sal_a']:.0f} / ${r['sal_b']:.0f}",
+                    style={"color": C_MUTED, "fontSize": "11px", "padding": "10px 8px",
+                           "textAlign": "center"}),
+            html.Td(_apply_btn(i, r), style={"padding": "10px 8px", "textAlign": "center"}),
+        ], style={"borderBottom": f"1px solid {C_GRID}",
+                  "background": C_CARD if i % 2 else "#253045"}))
+
+    header = html.Tr([
+        html.Th("", style={"padding": "8px", "color": C_MUTED,
+                            "fontSize": "11px", "textTransform": "uppercase",
+                            "letterSpacing": "0.06em", "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th(f"{team_a} gives", style={"padding": "8px", "color": C_HIT,
+                                          "fontSize": "11px", "textTransform": "uppercase",
+                                          "letterSpacing": "0.06em",
+                                          "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th(f"Δ {team_a}", style={"padding": "8px", "color": C_HIT,
+                                      "fontSize": "11px", "textTransform": "uppercase",
+                                      "letterSpacing": "0.06em", "textAlign": "center",
+                                      "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Opponent", style={"padding": "8px", "color": C_MUTED,
+                                   "fontSize": "11px", "textTransform": "uppercase",
+                                   "letterSpacing": "0.06em",
+                                   "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Opponent gives", style={"padding": "8px", "color": C_RP,
+                                         "fontSize": "11px", "textTransform": "uppercase",
+                                         "letterSpacing": "0.06em",
+                                         "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Δ Opponent", style={"padding": "8px", "color": C_RP,
+                                     "fontSize": "11px", "textTransform": "uppercase",
+                                     "letterSpacing": "0.06em", "textAlign": "center",
+                                     "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Δ Total", style={"padding": "8px", "color": C_TEXT,
+                                  "fontSize": "11px", "textTransform": "uppercase",
+                                  "letterSpacing": "0.06em", "textAlign": "center",
+                                  "borderLeft": f"2px solid {C_GRID}",
+                                  "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Salaries", style={"padding": "8px", "color": C_MUTED,
+                                   "fontSize": "11px", "textTransform": "uppercase",
+                                   "letterSpacing": "0.06em", "textAlign": "center",
+                                   "borderBottom": f"2px solid {C_GRID}"}),
+        html.Th("Apply", style={"padding": "8px", "color": C_MUTED,
+                                "fontSize": "11px", "textTransform": "uppercase",
+                                "letterSpacing": "0.06em", "textAlign": "center",
+                                "borderBottom": f"2px solid {C_GRID}"}),
+    ])
+
+    table = html.Table(
+        [html.Thead(header), html.Tbody(rows)],
+        style={"width": "100%", "borderCollapse": "collapse"},
+    )
+
+    return html.Div([
+        html.P(
+            f"Top {len(top)} trades (sorted by total SPTS synergy)  \u00b7  "
+            f"Salary tolerance \u00b1$3  \u00b7  Click \u2018Apply\u2019 to simulate on the full dashboard",
+            style={"color": C_MUTED, "fontSize": "12px", "marginBottom": "12px"},
+        ),
+        html.Div(table, style={
+            "background": C_CARD, "borderRadius": "12px",
+            "padding": "4px", "overflowX": "auto",
+        }),
+    ])
+
+
+# Apply-trade button from optimizer results → sets trade-patch-store
+@app.callback(
+    Output("trade-patch-store", "data", allow_duplicate=True),
+    Input({"type": "opt-apply-btn", "index": dash_ctx.ALL}, "n_clicks"),
+    State("opt-team-a",        "value"),
+    State("opt-team-b",        "value"),
+    State("opt-results",       "children"),
+    State("proj-system-radio", "value"),
+    State("trade-patch-store", "data"),
+    prevent_initial_call=True,
+)
+def apply_optimizer_trade(n_clicks_list, team_a, team_b, _results, sys_val, patch_data):
+    """
+    Because the Apply buttons in the table carry the patch data as a data attribute
+    we can't easily pass it through Dash callbacks. Instead we re-run find_optimal_trades
+    for just the clicked rank.  The click cost is cheap since it's a single combo.
+    """
+    if not any(n for n in (n_clicks_list or []) if n):
+        raise dash_ctx.dash.exceptions.PreventUpdate
+
+    clicked_index = next(
+        (i for i, n in enumerate(n_clicks_list or []) if n),
+        None,
+    )
+    if clicked_index is None:
+        raise dash_ctx.dash.exceptions.PreventUpdate
+
+    ctx_obj = _get_ctx(sys_val, patch_data)
+    hf = ctx_obj.hit_full.copy()
+    pf = ctx_obj.pit_full.copy()
+
+    search_teams = [t for t in teams if t != team_a] if team_b == "__ANY__" else [team_b]
+    all_results: list[dict] = []
+    for opp in search_teams:
+        res = find_optimal_trades(team_a, opp, hf, pf,
+                                  summary=ctx_obj.summary,
+                                  max_players=2, top_n=10)
+        for r in res:
+            r["_opp"] = opp
+        all_results.extend(res)
+
+    all_results.sort(key=lambda r: r["total_delta"], reverse=True)
+    top = all_results[:15]
+
+    if clicked_index >= len(top):
+        raise dash_ctx.dash.exceptions.PreventUpdate
+
+    r = top[clicked_index]
+    return {
+        "sys":       sys_val,
+        "team_a":    team_a,
+        "players_a": r["give_a"],
+        "drop_a":    [],
+        "team_b":    r["_opp"],
+        "players_b": r["give_b"],
+        "drop_b":    [],
+        "label":     (f"Optimizer #{clicked_index+1}: {team_a} gives "
+                      f"{', '.join(r['give_a'])} "
+                      f"\u2194 {r['_opp']} gives {', '.join(r['give_b'])}"),
+    }
 
 
 # ── Active-trade banner ────────────────────────────────────────────────────────────────

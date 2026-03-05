@@ -16,7 +16,8 @@ import os
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from dash import Dash, dcc, html, Input, Output, State, dash_table, ctx as dash_ctx
+from dash import Dash, dcc, html, Input, Output, State, dash_table, ctx as dash_ctx, ALL
+from dash.exceptions import PreventUpdate
 from pathlib import Path
 from ottoneu_power_rankings import optimal_lineup_spts, constrained_pitcher_spts, recompute_from_rosters
 from trade_optimizer import find_optimal_trades
@@ -2246,7 +2247,7 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
 # Apply-trade button from optimizer results → sets trade-patch-store
 @app.callback(
     Output("trade-patch-store", "data", allow_duplicate=True),
-    Input({"type": "opt-apply-btn", "index": dash_ctx.ALL}, "n_clicks"),
+    Input({"type": "opt-apply-btn", "index": ALL}, "n_clicks"),
     State("opt-team-a",        "value"),
     State("opt-team-b",        "value"),
     State("opt-results",       "children"),
@@ -2261,14 +2262,14 @@ def apply_optimizer_trade(n_clicks_list, team_a, team_b, _results, sys_val, patc
     for just the clicked rank.  The click cost is cheap since it's a single combo.
     """
     if not any(n for n in (n_clicks_list or []) if n):
-        raise dash_ctx.dash.exceptions.PreventUpdate
+        raise PreventUpdate
 
     clicked_index = next(
         (i for i, n in enumerate(n_clicks_list or []) if n),
         None,
     )
     if clicked_index is None:
-        raise dash_ctx.dash.exceptions.PreventUpdate
+        raise PreventUpdate
 
     ctx_obj = _get_ctx(sys_val, patch_data)
     hf = ctx_obj.hit_full.copy()
@@ -2288,7 +2289,7 @@ def apply_optimizer_trade(n_clicks_list, team_a, team_b, _results, sys_val, patc
     top = all_results[:15]
 
     if clicked_index >= len(top):
-        raise dash_ctx.dash.exceptions.PreventUpdate
+        raise PreventUpdate
 
     r = top[clicked_index]
     return {

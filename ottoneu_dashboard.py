@@ -70,7 +70,13 @@ class SysCtx:
                  raw_summary, raw_hitters, raw_sp, raw_rp, raw_roster,
                  raw_hit_full=None, raw_pit_full=None,
                  raw_fa_hit=None, raw_pit_fa=None):
-        for _df in (raw_summary, raw_hitters, raw_sp, raw_rp, raw_roster):
+        # Apply display-name mapping to every frame that carries a Team column,
+        # including hit_full / pit_full so the trade machine filter works correctly.
+        _team_frames = [raw_summary, raw_hitters, raw_sp, raw_rp, raw_roster]
+        for _opt in (raw_hit_full, raw_pit_full):
+            if _opt is not None and isinstance(_opt, pd.DataFrame) and not _opt.empty:
+                _team_frames.append(_opt)
+        for _df in _team_frames:
             if "Team" in _df.columns:
                 _df["Team"] = _df["Team"].replace(TEAM_NAMES)
         raw_summary = raw_summary.sort_values("Total_SPTS", ascending=False).reset_index(drop=True)
@@ -181,7 +187,7 @@ def tile_rank(col: str, team: str, ctx=None):
     if series is None:
         return None
     val = series.get(team)
-    if val is None or (hasattr(val, "__class__") and val != val):  # NaN check
+    if val is None or pd.isna(val):
         return None
     return int(val)
 
@@ -1480,8 +1486,6 @@ def render_roster_team(team: str, sys_val: str):
     ])
 
 
-
-
 # ── System-toggle callbacks for static charts ─────────────────────────────────
 
 @app.callback(Output("overview-bar", "figure"), Input("proj-system-radio", "value"))
@@ -1511,36 +1515,59 @@ def update_salary_figs(sys_val: str):
 
 _FA_TEAM = "__FA__"
 
+# Column lists used by the in-memory trade optimizer
+_TRADE_HIT_COLS = ["Name", "Pos", "SPTS", "SPTS/G", "AB", "H", "2B",
+                   "BB", "HR", "SB", "wOBA", "OPS"]
+_TRADE_PIT_NUMS = ["SV", "HLD", "IP", "GS", "SPTS", "SO", "BB", "HR", "FIP"]
+
+
+_FA_POOL_LIMIT = 150   # max FA players shown in the picker (already sorted by SPTS)
+
+
+def _fmt_hit_opts(df: pd.DataFrame) -> pd.DataFrame:
+    """Vectorised: build options rows {label, value, _s} for a hitter frame."""
+    df = df.copy()
+    df["_s"]  = pd.to_numeric(df["SPTS"] if "SPTS" in df.columns else 0,
+                               errors="coerce").fillna(0)
+    pos       = df["Pos"].fillna("?").astype(str) if "Pos" in df.columns else "?"
+    df["label"] = (df["Name"].astype(str) + " (" + pos + " · " +
+                   df["_s"].round(1).astype(str) + " SPTS)")
+    df["value"] = df["Name"].astype(str)
+    return df[["label", "value", "_s"]]
+
+
+def _fmt_pit_opts(df: pd.DataFrame) -> pd.DataFrame:
+    """Vectorised: build options rows {label, value, _s} for a pitcher frame."""
+    df = df.copy()
+    df["_s"]  = pd.to_numeric(df["SPTS"] if "SPTS" in df.columns else 0,
+                               errors="coerce").fillna(0)
+    role      = df["Role"].fillna("P").astype(str) if "Role" in df.columns else "P"
+    df["label"] = (df["Name"].astype(str) + " (" + role + " · " +
+                   df["_s"].round(1).astype(str) + " SPTS)")
+    df["value"] = df["Name"].astype(str)
+    return df[["label", "value", "_s"]]
+
 
 def _trade_player_options(team: str, ctx) -> list:
     """Roster options for a real team, or FA pool when team == _FA_TEAM."""
     if not team:
         return []
-    opts = []
+    parts: list[pd.DataFrame] = []
     if team == _FA_TEAM:
         if not ctx.fa_hit.empty:
-            for _, row in ctx.fa_hit.iterrows():
-                spts = float(pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0)
-                opts.append({"label": f"{row['Name']} ({row.get('Pos','?')} · {spts:.1f} SPTS)",
-                             "value": row["Name"], "_s": spts})
+            parts.append(_fmt_hit_opts(ctx.fa_hit.head(_FA_POOL_LIMIT)))
         if not ctx.fa_pit.empty:
-            for _, row in ctx.fa_pit.iterrows():
-                spts = float(pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0)
-                opts.append({"label": f"{row['Name']} ({row.get('Role','P')} · {spts:.1f} SPTS)",
-                             "value": row["Name"], "_s": spts})
+            parts.append(_fmt_pit_opts(ctx.fa_pit.head(_FA_POOL_LIMIT)))
     else:
         if not ctx.hit_full.empty and "Team" in ctx.hit_full.columns:
-            for _, row in ctx.hit_full[ctx.hit_full["Team"] == team].iterrows():
-                spts = float(pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0)
-                opts.append({"label": f"{row['Name']} ({row.get('Pos','?')} · {spts:.1f} SPTS)",
-                             "value": row["Name"], "_s": spts})
+            parts.append(_fmt_hit_opts(ctx.hit_full[ctx.hit_full["Team"] == team]))
         if not ctx.pit_full.empty and "Team" in ctx.pit_full.columns:
-            for _, row in ctx.pit_full[ctx.pit_full["Team"] == team].iterrows():
-                spts = float(pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0)
-                opts.append({"label": f"{row['Name']} ({row.get('Role','P')} · {spts:.1f} SPTS)",
-                             "value": row["Name"], "_s": spts})
-    opts.sort(key=lambda o: -o["_s"])
-    return [{"label": o["label"], "value": o["value"]} for o in opts]
+            parts.append(_fmt_pit_opts(ctx.pit_full[ctx.pit_full["Team"] == team]))
+    if not parts:
+        return []
+    combined = (pd.concat(parts, ignore_index=True)
+                  .sort_values("_s", ascending=False))
+    return combined[["label", "value"]].to_dict("records")
 
 
 def _evaluate_trade_logic(team_a, players_a, drop_a,
@@ -1605,18 +1632,23 @@ def _evaluate_trade_logic(team_a, players_a, drop_a,
         hf = hf[~((hf["Name"].isin(drop_b)) & (hf["Team"] == team_b))]
         pf = pf[~((pf["Name"].isin(drop_b)) & (pf["Team"] == team_b))]
 
-    _HIT_COLS  = ["Name", "Pos", "SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"]
-    _PIT_NUMS  = ["SV", "HLD", "IP", "GS", "SPTS", "SO", "BB", "HR", "FIP"]
-
     def _team_spts(team, h, p):
-        roster_h = h[h["Team"] == team][[c for c in _HIT_COLS if c in h.columns]].copy()
+        roster_h = h[h["Team"] == team][[c for c in _TRADE_HIT_COLS if c in h.columns]].copy()
         for col in ("SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"):
             if col in roster_h.columns:
                 roster_h[col] = pd.to_numeric(roster_h[col], errors="coerce").fillna(0)
+        # Derive SPTS/G for FA additions that lack it (avoids optimizer giving them 0 SPTS)
+        if "SPTS/G" in roster_h.columns and "SPTS" in roster_h.columns:
+            _mask = (roster_h["SPTS/G"] == 0) & (roster_h["SPTS"] > 0)
+            if _mask.any():
+                roster_h.loc[_mask, "SPTS/G"] = (roster_h.loc[_mask, "SPTS"] / _SLOT_G_CAP)
         roster_p = p[p["Team"] == team].copy()
-        for col in _PIT_NUMS:
-            roster_p[col] = pd.to_numeric(roster_p.get(col, 0), errors="coerce").fillna(0)
-        hit_spts, *_       = optimal_lineup_spts(roster_h)
+        for col in _TRADE_PIT_NUMS:
+            if col in roster_p.columns:
+                roster_p[col] = pd.to_numeric(roster_p[col], errors="coerce").fillna(0)
+            else:
+                roster_p[col] = 0.0
+        hit_spts, *_         = optimal_lineup_spts(roster_h)
         sp_spts, rp_spts, *_ = constrained_pitcher_spts(roster_p)
         return {"Hit_SPTS": round(hit_spts, 1), "SP_SPTS": round(sp_spts, 1),
                 "RP_SPTS":  round(rp_spts,  1),

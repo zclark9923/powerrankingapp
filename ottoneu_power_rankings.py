@@ -249,6 +249,14 @@ def constrained_pitcher_spts(team_pit: pd.DataFrame) -> tuple:
             pit_fip, sp_detail, rp_detail)
 
 
+def _pit_role_from_row(row) -> str:
+    """SP / RP classification from a single pitcher row (handles Ros_* fallbacks)."""
+    _ip  = row.get("IP",  0) or row.get("Ros_IP",  0)
+    _sv  = row.get("SV",  0) or row.get("Ros_SV",  0)
+    _hld = row.get("HLD", 0) or row.get("Ros_HLD", 0)
+    return "RP" if (_sv > 2 or _hld > 5 or _ip < 70) else "SP"
+
+
 def _apply_pos(df, pos_by_playerid: dict, pos_by_mlbam: dict,
                age_by_mlbam: dict, fallback: str = POS_FALLBACK):
     """Assign Pos and Age columns using fielding-file eligibility + MLB API fallback."""
@@ -437,6 +445,14 @@ def run_projection_system(sys_name: str, hit_proj_file: str,
         if col in fa_hit_raw.columns: fa_hit_raw[col] = fa_hit_raw[col] * SCHEDULE_SCALE
     for col in _PIT_SCALE:
         if col in fa_pit_raw.columns: fa_pit_raw[col] = fa_pit_raw[col] * SCHEDULE_SCALE
+    # Ensure FA hitters have SPTS/G — derive from projected games if the
+    # projection file didn't include the column (coercion left it at all-zeros).
+    if (fa_hit_raw["SPTS/G"] == 0).all() and (fa_hit_raw["SPTS"] > 0).any():
+        _fa_g = pd.to_numeric(
+            fa_hit_raw["G"] if "G" in fa_hit_raw.columns else MAX_PLAYER_G,
+            errors="coerce",
+        ).clip(lower=1).fillna(MAX_PLAYER_G)
+        fa_hit_raw["SPTS/G"] = (fa_hit_raw["SPTS"] / _fa_g).replace([np.inf, -np.inf], 0)
     # Assign positions using fielding file (PlayerId-keyed); default OF for unknowns
     fa_hit_raw["Pos"] = fa_hit_raw["PlayerId"].astype(str).apply(
         lambda pid: pos_by_playerid.get(pid, "OF"))
@@ -505,17 +521,10 @@ def run_projection_system(sys_name: str, hit_proj_file: str,
 
         pit_sal_df = team_pit_full[~team_pit_full["PlayerId"].astype(str).isin(twoway_pids)]
 
-        def _pit_role(p):
-            _ip  = p.get("IP",  0) or p.get("Ros_IP",  0)
-            _sv  = p.get("SV",  0) or p.get("Ros_SV",  0)
-            _hld = p.get("HLD", 0) or p.get("Ros_HLD", 0)
-            return "RP" if (_sv > 2 or _hld > 5 or _ip < 70) else "SP"
-
         sal_hit = float(team_hit_full["Salary"].sum())
-        sal_sp  = sum(float(p.get("Salary", 0)) for _, p in pit_sal_df.iterrows()
-                      if _pit_role(p) == "SP")
-        sal_rp  = sum(float(p.get("Salary", 0)) for _, p in pit_sal_df.iterrows()
-                      if _pit_role(p) == "RP")
+        # Role column was already vectorised on pit_full before this loop
+        sal_sp  = float(pit_sal_df[pit_sal_df["Role"] == "SP"]["Salary"].sum())
+        sal_rp  = float(pit_sal_df[pit_sal_df["Role"] == "RP"]["Salary"].sum())
         age_hit = team_hit_full[["PlayerId", "Age"]].drop_duplicates("PlayerId")
         age_pit = pit_sal_df[["PlayerId", "Age"]].drop_duplicates("PlayerId")
         all_ages = pd.concat([age_hit["Age"], age_pit["Age"]]).dropna()
@@ -538,10 +547,7 @@ def run_projection_system(sys_name: str, hit_proj_file: str,
         for _, p in team_pit_full.iterrows():
             if str(p.get("PlayerId", "")) in twoway_pids:
                 continue
-            _ip  = p.get("IP",  0) or p.get("Ros_IP",  0)
-            _sv  = p.get("SV",  0) or p.get("Ros_SV",  0)
-            _hld = p.get("HLD", 0) or p.get("Ros_HLD", 0)
-            role = "RP" if (_sv > 2 or _hld > 5 or _ip < 70) else "SP"
+            role = p.get("Role") or _pit_role_from_row(p)
             _mid = p.get("MLBAMID")
             roster_records.append({
                 "Team":    team,   "Name":    p["Name"],

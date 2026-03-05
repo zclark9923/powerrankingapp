@@ -2142,6 +2142,8 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
                         set_progress=None, salary_tol=3):
     """Run the optimizer and return (children, store_data)."""
+    import time as _time
+
     def _prog(msg):
         if set_progress:
             set_progress(msg)
@@ -2150,22 +2152,42 @@ def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
     hf = ctx_obj.hit_full.copy()
     pf = ctx_obj.pit_full.copy()
 
+    # ── Salary sanity check ───────────────────────────────────────────────────
+    if "Salary" not in hf.columns or float(hf["Salary"].fillna(0).max()) == 0:
+        return (html.P(
+            "\u26a0\ufe0f Salary data is missing or all zeros \u2014 "
+            "re-run ottoneu_power_rankings.py to regenerate roster files "
+            "with Salary columns before using the Trade Optimizer.",
+            style={"color": "#F59E0B", "textAlign": "center", "marginTop": "20px"},
+        ), [])
+
     all_teams = [t for t in teams if t != team_a]
     search_teams = all_teams if team_b == "__ANY__" else [team_b]
     n_opps = len(search_teams)
 
     all_results: list[dict] = []
-    # Divide 20-second hard budget evenly across opponents (min 3 s each)
-    per_opp_budget = max(3.0, 20.0 / n_opps)
+    # ── Single global 20-second wall shared across all opponents ─────────────
+    _global_deadline = _time.time() + 20.0
+
     for idx, opp in enumerate(search_teams):
+        remaining = _global_deadline - _time.time()
+        if remaining <= 0:
+            _prog(f"Time limit reached \u2014 searched {idx} of {n_opps} opponents")
+            break
         _prog(f"Searching {opp} ({idx + 1}/{n_opps})\u2026")
+
+        # Wire find_optimal_trades progress back to the Dash progress bar
+        def _opp_progress(pct, msg, _o=opp, _i=idx):
+            _prog(f"{_o} ({_i + 1}/{n_opps}) \u2014 {msg}")
+
         results = find_optimal_trades(
             team_a, opp, hf, pf,
             summary=ctx_obj.summary,
             max_players=max_players,
             top_n=10,
-            time_budget=per_opp_budget,
+            time_budget=remaining,
             salary_tol=salary_tol,
+            progress_cb=_opp_progress,
         )
         for r in results:
             r["_opp"] = opp

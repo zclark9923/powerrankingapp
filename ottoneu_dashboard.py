@@ -18,7 +18,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from dash import Dash, dcc, html, Input, Output, State, dash_table, ctx as dash_ctx
 from pathlib import Path
-from ottoneu_power_rankings import optimal_lineup_spts, constrained_pitcher_spts
+from ottoneu_power_rankings import optimal_lineup_spts, constrained_pitcher_spts, recompute_from_rosters
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Relative path so the app works both locally and when deployed
@@ -1086,6 +1086,11 @@ app.layout = html.Div(className="page-wrap", style={
               "alignItems": "center", "marginBottom": "24px",
               "flexWrap": "wrap", "gap": "16px"}),
 
+    # Active-trade banner (hidden when no patch is in effect)
+    html.Div(id="trade-active-banner", style={"marginBottom": "0"}),
+
+    dcc.Store(id="trade-patch-store", storage_type="session"),
+
     dcc.Tabs(id="main-tabs", value="rankings",
              style={"marginBottom": "24px"},
              colors={"border": C_GRID, "primary": C_SP, "background": C_CARD},
@@ -1318,9 +1323,10 @@ app.layout = html.Div(className="page-wrap", style={
 
 @app.callback(Output("report-card", "children"),
               Input("team-dropdown", "value"),
-              Input("proj-system-radio", "value"))
-def render_report_card(team: str, sys_val: str):
-    ctx   = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+              Input("proj-system-radio", "value"),
+              Input("trade-patch-store", "data"))
+def render_report_card(team: str, sys_val: str, patch_data):
+    ctx   = _get_ctx(sys_val, patch_data)
     row   = ctx.summary[ctx.summary["Team"] == team].iloc[0]
     rank  = int(row["Rank"])
     n     = len(ctx.summary)
@@ -1410,9 +1416,10 @@ def sync_dropdown_from_bar(click_data):
     Input("compare-a", "value"),
     Input("compare-b", "value"),
     Input("proj-system-radio", "value"),
+    Input("trade-patch-store", "data"),
 )
-def render_comparison(team_a: str, team_b: str, sys_val: str):
-    ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+def render_comparison(team_a: str, team_b: str, sys_val: str, patch_data):
+    ctx = _get_ctx(sys_val, patch_data)
     return html.Div([
         _team_comparison_col(team_a, ctx),
         html.Div(className="compare-divider", style={
@@ -1428,11 +1435,12 @@ def render_comparison(team_a: str, team_b: str, sys_val: str):
     Output("roster-team-output", "children"),
     Input("roster-team-dropdown", "value"),
     Input("proj-system-radio", "value"),
+    Input("trade-patch-store", "data"),
 )
-def render_roster_team(team: str, sys_val: str):
+def render_roster_team(team: str, sys_val: str, patch_data):
     if not team:
         return html.Div()
-    ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+    ctx = _get_ctx(sys_val, patch_data)
     row = ctx.summary[ctx.summary["Team"] == team].iloc[0]
 
     total_sal   = float(row.get("Total_Salary", 0))
@@ -1488,24 +1496,29 @@ def render_roster_team(team: str, sys_val: str):
 
 # ── System-toggle callbacks for static charts ─────────────────────────────────
 
-@app.callback(Output("overview-bar", "figure"), Input("proj-system-radio", "value"))
-def update_overview(sys_val: str):
-    return build_overview_fig(_ALL_CTX.get(sys_val, _DEFAULT_CTX).summary)
+@app.callback(Output("overview-bar", "figure"),
+              Input("proj-system-radio", "value"),
+              Input("trade-patch-store", "data"))
+def update_overview(sys_val: str, patch_data):
+    return build_overview_fig(_get_ctx(sys_val, patch_data).summary)
 
 
-@app.callback(Output("scatter-fig", "figure"), Input("proj-system-radio", "value"))
-def update_scatter(sys_val: str):
-    return build_scatter_fig(_ALL_CTX.get(sys_val, _DEFAULT_CTX).summary)
+@app.callback(Output("scatter-fig", "figure"),
+              Input("proj-system-radio", "value"),
+              Input("trade-patch-store", "data"))
+def update_scatter(sys_val: str, patch_data):
+    return build_scatter_fig(_get_ctx(sys_val, patch_data).summary)
 
 
 @app.callback(
-    Output("salary-bar-fig", "figure"),
+    Output("salary-bar-fig",    "figure"),
     Output("salary-scatter-fig", "figure"),
-    Output("age-bar-fig", "figure"),
+    Output("age-bar-fig",        "figure"),
     Input("proj-system-radio", "value"),
+    Input("trade-patch-store", "data"),
 )
-def update_salary_figs(sys_val: str):
-    ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+def update_salary_figs(sys_val: str, patch_data):
+    ctx = _get_ctx(sys_val, patch_data)
     return (build_salary_bar_fig(ctx),
             build_salary_scatter_fig(ctx),
             build_age_bar_fig(ctx))
@@ -1519,6 +1532,88 @@ _FA_TEAM = "__FA__"
 _TRADE_HIT_COLS = ["Name", "Pos", "SPTS", "SPTS/G", "AB", "H", "2B",
                    "BB", "HR", "SB", "wOBA", "OPS"]
 _TRADE_PIT_NUMS = ["SV", "HLD", "IP", "GS", "SPTS", "SO", "BB", "HR", "FIP"]
+
+
+def _apply_trade_to_frames(hf: pd.DataFrame, pf: pd.DataFrame,
+                           fa_hit: pd.DataFrame, fa_pit: pd.DataFrame,
+                           team_a: str, players_a: list, drop_a: list,
+                           team_b: str, players_b: list, drop_b: list
+                           ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Apply a trade / FA addition / drop in-place on copies of hf/pf.
+    Returns (modified_hf, modified_pf).
+    """
+    fa_a = (team_a == _FA_TEAM)
+    fa_b = (team_b == _FA_TEAM)
+
+    def _add_fa(names: list, target: str):
+        nonlocal hf, pf
+        if not names:
+            return
+        rh = fa_hit[fa_hit["Name"].isin(names)].copy() if not fa_hit.empty else pd.DataFrame()
+        rp = fa_pit[fa_pit["Name"].isin(names)].copy() if not fa_pit.empty else pd.DataFrame()
+        if not rh.empty:
+            rh["Team"] = target
+            hf = pd.concat([hf, rh], ignore_index=True)
+        if not rp.empty:
+            rp["Team"] = target
+            for _col in ("Ros_IP", "Ros_SV", "Ros_HLD"):
+                if _col not in rp.columns:
+                    rp[_col] = 0.0
+            pf = pd.concat([pf, rp], ignore_index=True)
+
+    if not fa_a and not fa_b:
+        hf.loc[(hf["Name"].isin(players_a)) & (hf["Team"] == team_a), "Team"] = team_b
+        pf.loc[(pf["Name"].isin(players_a)) & (pf["Team"] == team_a), "Team"] = team_b
+        hf.loc[(hf["Name"].isin(players_b)) & (hf["Team"] == team_b), "Team"] = team_a
+        pf.loc[(pf["Name"].isin(players_b)) & (pf["Team"] == team_b), "Team"] = team_a
+    elif fa_a:
+        _add_fa(players_a, team_b)
+        hf = hf[~((hf["Name"].isin(players_b)) & (hf["Team"] == team_b))]
+        pf = pf[~((pf["Name"].isin(players_b)) & (pf["Team"] == team_b))]
+    else:  # fa_b
+        _add_fa(players_b, team_a)
+        hf = hf[~((hf["Name"].isin(players_a)) & (hf["Team"] == team_a))]
+        pf = pf[~((pf["Name"].isin(players_a)) & (pf["Team"] == team_a))]
+
+    if not fa_a and drop_a:
+        hf = hf[~((hf["Name"].isin(drop_a)) & (hf["Team"] == team_a))]
+        pf = pf[~((pf["Name"].isin(drop_a)) & (pf["Team"] == team_a))]
+    if not fa_b and drop_b:
+        hf = hf[~((hf["Name"].isin(drop_b)) & (hf["Team"] == team_b))]
+        pf = pf[~((pf["Name"].isin(drop_b)) & (pf["Team"] == team_b))]
+
+    return hf, pf
+
+
+def _build_patched_ctx(base_ctx: SysCtx, patch: dict) -> SysCtx:
+    """
+    Apply the patch dict to base_ctx, recompute all rankings/lineups for every
+    team, and return a fully functional SysCtx.
+    """
+    hf, pf = _apply_trade_to_frames(
+        base_ctx.hit_full.copy(), base_ctx.pit_full.copy(),
+        base_ctx.fa_hit, base_ctx.fa_pit,
+        patch["team_a"], patch["players_a"], patch["drop_a"],
+        patch["team_b"], patch["players_b"], patch["drop_b"],
+    )
+    result = recompute_from_rosters(hf, pf, base_ctx.fa_hit, base_ctx.fa_pit)
+    return SysCtx(
+        base_ctx.sys_name,
+        result["rankings"], result["hitters"],
+        result["sp"],       result["rp"],
+        result["roster"],
+        result["hit_full"], result["pit_full"],
+        result["fa_hit"],   result["fa_pit"],
+    )
+
+
+def _get_ctx(sys_val: str, patch_data) -> SysCtx:
+    """Return base context, or a fully recomputed patched context if a trade is active."""
+    base = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+    if not patch_data or patch_data.get("sys") != sys_val:
+        return base
+    return _build_patched_ctx(base, patch_data)
 
 
 _FA_POOL_LIMIT = 150   # max FA players shown in the picker (already sorted by SPTS)
@@ -1573,7 +1668,8 @@ def _trade_player_options(team: str, ctx) -> list:
 def _evaluate_trade_logic(team_a, players_a, drop_a,
                           team_b, players_b, drop_b, ctx):
     """
-    Swap players, apply FA additions and drops in-memory, re-run optimizers.
+    Swap players, apply FA additions and drops in-memory, re-run optimizers
+    for affected teams only, and return a summary dict for the result cards.
     Either side can be _FA_TEAM (Free Agents).
     """
     fa_a = (team_a == _FA_TEAM)
@@ -1588,49 +1684,12 @@ def _evaluate_trade_logic(team_a, players_a, drop_a,
     drop_a    = list(drop_a or [])
     drop_b    = list(drop_b or [])
 
-    hf = ctx.hit_full.copy()
-    pf = ctx.pit_full.copy()
-
-    def _add_fa(names, target):
-        nonlocal hf, pf
-        if not names:
-            return
-        rh = ctx.fa_hit[ctx.fa_hit["Name"].isin(names)].copy() if not ctx.fa_hit.empty else pd.DataFrame()
-        rp = ctx.fa_pit[ctx.fa_pit["Name"].isin(names)].copy() if not ctx.fa_pit.empty else pd.DataFrame()
-        if not rh.empty:
-            rh["Team"] = target
-            hf = pd.concat([hf, rh], ignore_index=True)
-        if not rp.empty:
-            rp["Team"] = target
-            for col in ("Ros_IP", "Ros_SV", "Ros_HLD"):
-                if col not in rp.columns: rp[col] = 0.0
-            pf = pd.concat([pf, rp], ignore_index=True)
-
-    # ── Apply trade / acquisition ─────────────────────────────────────────
-    if not fa_a and not fa_b:
-        # Normal trade: swap
-        hf.loc[(hf["Name"].isin(players_a)) & (hf["Team"] == team_a), "Team"] = team_b
-        pf.loc[(pf["Name"].isin(players_a)) & (pf["Team"] == team_a), "Team"] = team_b
-        hf.loc[(hf["Name"].isin(players_b)) & (hf["Team"] == team_b), "Team"] = team_a
-        pf.loc[(pf["Name"].isin(players_b)) & (pf["Team"] == team_b), "Team"] = team_a
-    elif fa_a:
-        # players_a = FA players going to team_b; players_b leave team_b
-        _add_fa(players_a, team_b)
-        hf = hf[~((hf["Name"].isin(players_b)) & (hf["Team"] == team_b))]
-        pf = pf[~((pf["Name"].isin(players_b)) & (pf["Team"] == team_b))]
-    else:  # fa_b
-        # players_b = FA players going to team_a; players_a leave team_a
-        _add_fa(players_b, team_a)
-        hf = hf[~((hf["Name"].isin(players_a)) & (hf["Team"] == team_a))]
-        pf = pf[~((pf["Name"].isin(players_a)) & (pf["Team"] == team_a))]
-
-    # ── Apply drops ───────────────────────────────────────────────────────
-    if not fa_a and drop_a:
-        hf = hf[~((hf["Name"].isin(drop_a)) & (hf["Team"] == team_a))]
-        pf = pf[~((pf["Name"].isin(drop_a)) & (pf["Team"] == team_a))]
-    if not fa_b and drop_b:
-        hf = hf[~((hf["Name"].isin(drop_b)) & (hf["Team"] == team_b))]
-        pf = pf[~((pf["Name"].isin(drop_b)) & (pf["Team"] == team_b))]
+    hf, pf = _apply_trade_to_frames(
+        ctx.hit_full.copy(), ctx.pit_full.copy(),
+        ctx.fa_hit, ctx.fa_pit,
+        team_a, players_a, drop_a,
+        team_b, players_b, drop_b,
+    )
 
     def _team_spts(team, h, p):
         roster_h = h[h["Team"] == team][[c for c in _TRADE_HIT_COLS if c in h.columns]].copy()
@@ -1835,15 +1894,17 @@ def populate_trade_b(team_b, sys_val):
     Output("trade-players-b", "value", allow_duplicate=True),
     Output("trade-drop-b",    "value", allow_duplicate=True),
     Output("trade-result",    "children", allow_duplicate=True),
+    Output("trade-patch-store", "data",   allow_duplicate=True),
     Input("trade-reset-btn",  "n_clicks"),
     prevent_initial_call=True,
 )
 def reset_trade(_):
-    return [], [], [], [], html.Div()
+    return [], [], [], [], html.Div(), None
 
 
 @app.callback(
-    Output("trade-result", "children"),
+    Output("trade-result",     "children"),
+    Output("trade-patch-store", "data"),
     Input("trade-evaluate-btn", "n_clicks"),
     State("trade-team-a",    "value"),
     State("trade-players-a", "value"),
@@ -1856,26 +1917,54 @@ def reset_trade(_):
 )
 def evaluate_trade(n_clicks, team_a, players_a, drop_a,
                    team_b, players_b, drop_b, sys_val):
+    _no_store = None   # returned when we don’t want to commit a patch
+
     if not team_a or not team_b:
-        return html.P("Please select both teams.", style={"color": C_MUTED})
+        return html.P("Please select both teams.", style={"color": C_MUTED}), _no_store
     if team_a == _FA_TEAM and team_b == _FA_TEAM:
-        return html.P("At least one side must be a real team.", style={"color": C_MUTED})
+        return html.P("At least one side must be a real team.", style={"color": C_MUTED}), _no_store
 
-    ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+    base_ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
 
-    if ctx.hit_full.empty or ctx.pit_full.empty:
+    if base_ctx.hit_full.empty or base_ctx.pit_full.empty:
         return html.P(
             "Trade machine needs updated data — re-run ottoneu_power_rankings.py "
             "to regenerate the workbook, then redeploy.",
             style={"color": "#EF4444", "fontSize": "13px"},
-        )
+        ), _no_store
+
+    players_a = list(players_a or [])[:3]
+    players_b = list(players_b or [])[:3]
+    drop_a    = list(drop_a    or [])
+    drop_b    = list(drop_b    or [])
 
     result = _evaluate_trade_logic(
-        team_a, list(players_a or [])[:3], list(drop_a or []),
-        team_b, list(players_b or [])[:3], list(drop_b or []), ctx)
+        team_a, players_a, drop_a,
+        team_b, players_b, drop_b, base_ctx)
 
     if result is None:
-        return html.P("Could not evaluate trade.", style={"color": C_MUTED})
+        return html.P("Could not evaluate trade.", style={"color": C_MUTED}), _no_store
+
+    # Build a human-readable label for the banner
+    fa_a = (team_a == _FA_TEAM)
+    fa_b = (team_b == _FA_TEAM)
+    if   fa_a and players_a:
+        _label = f"FA pickup: {', '.join(players_a)} → {team_b}"
+    elif fa_b and players_b:
+        _label = f"FA pickup: {', '.join(players_b)} → {team_a}"
+    elif players_a and players_b:
+        _label = (f"{', '.join(players_a)} ({team_a}) ⇄ "
+                  f"{', '.join(players_b)} ({team_b})")
+    else:
+        _drop_all = drop_a + drop_b
+        _label = f"Drop: {', '.join(_drop_all)}" if _drop_all else "Roster change"
+
+    patch = {
+        "sys":      sys_val,
+        "team_a":   team_a,   "players_a": players_a, "drop_a": drop_a,
+        "team_b":   team_b,   "players_b": players_b, "drop_b": drop_b,
+        "label":    _label,
+    }
 
     cards = []
     accents = {team_a: C_HIT, team_b: C_RP}
@@ -1894,10 +1983,34 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 
     return html.Div([
         html.Div(cards, style={"display": "flex", "gap": "16px", "alignItems": "stretch"}),
-        html.P("Rankings re-computed across the full league with the modified rosters.",
+        html.P("Rankings re-computed across the full league with the modified rosters. "
+               "All other dashboard tabs now reflect these simulated rosters.",
                style={"color": C_MUTED, "fontSize": "11px",
                       "marginTop": "12px", "textAlign": "center"}),
-    ])
+    ]), patch
+
+
+# ── Active-trade banner ────────────────────────────────────────────────────────────────
+
+@app.callback(
+    Output("trade-active-banner", "children"),
+    Input("trade-patch-store",    "data"),
+)
+def update_trade_banner(patch_data):
+    if not patch_data:
+        return html.Div()
+    label = patch_data.get("label", "Roster change active")
+    return html.Div([
+        html.Span("⚠️ SIMULATED ROSTERS ACTIVE — ",
+                  style={"fontWeight": "700", "color": "#F59E0B"}),
+        html.Span(label, style={"color": C_TEXT}),
+        html.Span("  ·  Go to Trade Machine and click Reset to restore live rosters.",
+                  style={"color": C_MUTED, "fontSize": "12px"}),
+    ], style={
+        "background": "#1E293B", "border": "1px solid #F59E0B",
+        "borderRadius": "8px", "padding": "10px 16px",
+        "marginBottom": "16px", "fontSize": "13px",
+    })
 
 
 server = app.server  # exposed for gunicorn: `gunicorn ottoneu_dashboard:server`

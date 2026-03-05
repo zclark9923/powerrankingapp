@@ -634,6 +634,172 @@ def run_projection_system(sys_name: str, hit_proj_file: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# recompute_from_rosters – re-run optimisers on already-processed DataFrames
+# ─────────────────────────────────────────────────────────────────────────────
+
+def recompute_from_rosters(hit_full: pd.DataFrame, pit_full: pd.DataFrame,
+                           fa_hit: pd.DataFrame | None = None,
+                           fa_pit: pd.DataFrame | None = None) -> dict:
+    """
+    Re-run the lineup and pitching optimisers on already-processed hit_full /
+    pit_full frames (e.g. after an in-memory trade-machine swap).  Returns a
+    result dict with the same keys as run_projection_system() so that a fresh
+    SysCtx can be constructed from it.
+
+    Does NOT read any files — everything is derived from the passed DataFrames.
+    """
+    _HIT_OPT_COLS = [c for c in ("Name", "Pos", "SPTS", "SPTS/G",
+                                  "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS")
+                     if c in hit_full.columns]
+
+    teams = sorted(set(hit_full["Team"].dropna().unique()) |
+                   set(pit_full["Team"].dropna().unique()))
+    results, team_lineups, team_pitching, roster_records = [], {}, {}, []
+
+    # Build name→MLBAMID map from both frames
+    name_to_mlbam: dict = {}
+    for _src in (hit_full, pit_full):
+        if "MLBAMID" not in _src.columns:
+            continue
+        for _, _r in _src[["Name", "MLBAMID"]].drop_duplicates("Name").iterrows():
+            if pd.notna(_r["MLBAMID"]):
+                name_to_mlbam.setdefault(str(_r["Name"]), int(_r["MLBAMID"]))
+
+    for team in teams:
+        # ── Hitting ────────────────────────────────────────────────────────
+        roster = hit_full[hit_full["Team"] == team][_HIT_OPT_COLS].copy()
+        for col in ("SPTS", "SPTS/G"):
+            if col in roster.columns:
+                roster[col] = pd.to_numeric(roster[col], errors="coerce").fillna(0)
+        if "SPTS/G" in roster.columns and "SPTS" in roster.columns:
+            _mask = (roster["SPTS/G"] == 0) & (roster["SPTS"] > 0)
+            if _mask.any():
+                roster.loc[_mask, "SPTS/G"] = roster.loc[_mask, "SPTS"] / MAX_PLAYER_G
+
+        hit_spts, hit_ab, hit_h, hit_2b, hit_bb, hit_hr, hit_sb, hit_woba, hit_ops, lineup = \
+            optimal_lineup_spts(roster)
+        team_lineups[team] = lineup
+
+        # ── Pitching ───────────────────────────────────────────────────────
+        pit_t = pit_full[pit_full["Team"] == team].copy()
+        for col in ("SPTS", "IP", "SV", "HLD", "GS", "SO", "BB", "HR", "FIP",
+                    "Ros_IP", "Ros_SV", "Ros_HLD"):
+            if col in pit_t.columns:
+                pit_t[col] = pd.to_numeric(pit_t[col], errors="coerce").fillna(0)
+            else:
+                pit_t[col] = 0.0
+
+        sp_spts, rp_spts, sv_c, hld_c, pit_k, pit_bb_v, pit_hr_v, pit_fip, sp_det, rp_det = \
+            constrained_pitcher_spts(pit_t)
+        team_pitching[team] = (sp_det, rp_det)
+
+        used_spts: dict = {}
+        for _r in lineup:
+            used_spts[_r["Name"]] = used_spts.get(_r["Name"], 0.0) + _r["SPTS"]
+        for _r in sp_det:
+            used_spts[_r["Name"]] = used_spts.get(_r["Name"], 0.0) + _r["SPTS_used"]
+        for _r in rp_det:
+            used_spts[_r["Name"]] = used_spts.get(_r["Name"], 0.0) + _r["SPTS_used"]
+
+        # ── Salary / age ───────────────────────────────────────────────────
+        team_hit = hit_full[hit_full["Team"] == team]
+        team_pit = pit_full[pit_full["Team"] == team]
+        sal_hit = float(team_hit["Salary"].sum()) if "Salary" in team_hit.columns else 0.0
+        if "Role" in team_pit.columns and "Salary" in team_pit.columns:
+            sal_sp = float(team_pit[team_pit["Role"] == "SP"]["Salary"].sum())
+            sal_rp = float(team_pit[team_pit["Role"] == "RP"]["Salary"].sum())
+        else:
+            sal_sp = sal_rp = 0.0
+        _ages = pd.concat([
+            team_hit["Age"] if "Age" in team_hit.columns else pd.Series(dtype=float),
+            team_pit["Age"] if "Age" in team_pit.columns else pd.Series(dtype=float),
+        ]).dropna()
+        avg_age = round(float(_ages.mean()), 1) if len(_ages) > 0 else 0.0
+
+        sp_ip  = sum(p["IP_used"] for p in sp_det)
+        rp_ip  = sum(p["IP_used"] for p in rp_det)
+
+        results.append({
+            "Team":         team,
+            "Hit_SPTS":     round(hit_spts, 1),      "SP_SPTS":  round(sp_spts, 1),
+            "RP_SPTS":      round(rp_spts, 1),        "Pit_SPTS": round(sp_spts + rp_spts, 1),
+            "Total_SPTS":   round(hit_spts + sp_spts + rp_spts, 1),
+            "Hit_AB":       round(hit_ab, 1),          "Hit_H":    round(hit_h,   1),
+            "Hit_2B":       round(hit_2b, 1),          "Hit_BB":   round(hit_bb,  1),
+            "Hit_HR":       round(hit_hr, 1),          "Hit_SB":   round(hit_sb,  1),
+            "Hit_wOBA":     round(hit_woba, 3),        "Hit_OPS":  round(hit_ops, 3),
+            "Pit_IP":       round(sp_ip + rp_ip, 1),
+            "SV":           round(sv_c, 1),            "HLD":      round(hld_c, 1),
+            "Pit_K":        round(pit_k, 1),           "Pit_BB":   round(pit_bb_v, 1),
+            "Pit_HR":       round(pit_hr_v, 1),        "Pit_FIP":  pit_fip,
+            "SP_IP":        round(sp_ip, 1),           "RP_IP":    round(rp_ip, 1),
+            "Total_IP":     round(sp_ip + rp_ip, 1),
+            "Total_Salary": round(sal_hit + sal_sp + sal_rp, 0),
+            "Sal_Hit":      round(sal_hit, 0),
+            "Sal_SP":       round(sal_sp,  0),
+            "Sal_RP":       round(sal_rp,  0),
+            "Avg_Age":      avg_age,
+            "N_Bat":        len(team_hit),
+            "N_Pit":        len(team_pit),
+        })
+
+        # ── Roster records ─────────────────────────────────────────────────
+        for _, p in team_hit.iterrows():
+            raw_pos = p.get("Pos", "?")
+            disp_pos = "Util" if str(raw_pos) == "DH" else raw_pos
+            _mid = p.get("MLBAMID")
+            roster_records.append({
+                "Team": team, "Name": p["Name"], "Role": "H",
+                "Pos": disp_pos, "Salary": p.get("Salary", 0),
+                "Age": p.get("Age"),
+                "MLBAMID": int(_mid) if pd.notna(_mid) else None,
+                "SPTS": round(used_spts.get(p["Name"], 0.0), 1),
+            })
+        for _, p in team_pit.iterrows():
+            role = p.get("Role") or _pit_role_from_row(p)
+            _mid = p.get("MLBAMID")
+            roster_records.append({
+                "Team": team, "Name": p["Name"], "Role": role,
+                "Pos": str(role), "Salary": p.get("Salary", 0),
+                "Age": p.get("Age"),
+                "MLBAMID": int(_mid) if pd.notna(_mid) else None,
+                "SPTS": round(used_spts.get(p["Name"], 0.0), 1),
+            })
+
+    rankings = (pd.DataFrame(results)
+                .sort_values("Total_SPTS", ascending=False)
+                .reset_index(drop=True))
+    rankings.index += 1
+    rankings = rankings.reset_index().rename(columns={"index": "Rank"})
+    team_rank = {row["Team"]: row["Rank"] for _, row in rankings.iterrows()}
+
+    lineup_records, sp_records, rp_records = [], [], []
+    for _team, _lineup in team_lineups.items():
+        for _row in _lineup:
+            lineup_records.append({"Rank": team_rank.get(_team), "Team": _team,
+                                    "MLBAMID": name_to_mlbam.get(_row["Name"]), **_row})
+    for _team, (_sp, _rp) in team_pitching.items():
+        for _row in _sp:
+            sp_records.append({"Rank": team_rank.get(_team), "Team": _team,
+                                "MLBAMID": name_to_mlbam.get(_row["Name"]), **_row})
+        for _row in _rp:
+            rp_records.append({"Rank": team_rank.get(_team), "Team": _team,
+                                "MLBAMID": name_to_mlbam.get(_row["Name"]), **_row})
+
+    return {
+        "rankings": rankings,
+        "hitters":  pd.DataFrame(lineup_records),
+        "sp":       pd.DataFrame(sp_records),
+        "rp":       pd.DataFrame(rp_records),
+        "roster":   pd.DataFrame(roster_records),
+        "hit_full": hit_full,
+        "pit_full": pit_full,
+        "fa_hit":   fa_hit if fa_hit is not None else pd.DataFrame(),
+        "fa_pit":   fa_pit if fa_pit is not None else pd.DataFrame(),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # main – only runs when executed directly
 # ─────────────────────────────────────────────────────────────────────────────
 

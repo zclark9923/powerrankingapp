@@ -186,6 +186,8 @@ def _generate_candidates(
     marginals_b: dict[str, float],
     max_players: int,
     salary_tol: float,
+    untouchables_a: set[str],
+    untouchables_b: set[str],
 ) -> list[dict]:
     """
     Generate trade candidates via beam search.
@@ -203,6 +205,10 @@ def _generate_candidates(
     """
     seen: set[tuple] = set()
     candidates: list[dict] = []
+
+    # Remove untouchable players from the tradeable pools
+    pool_a = [p for p in pool_a if p["Name"] not in untouchables_a]
+    pool_b = [p for p in pool_b if p["Name"] not in untouchables_b]
 
     def _cand_key(ga: list[dict], gb: list[dict]) -> tuple:
         return (frozenset(p["Name"] for p in ga),
@@ -319,6 +325,8 @@ def find_optimal_trades(
     salary_tol: float = SALARY_TOLERANCE,
     time_budget: float = 20.0,
     progress_cb=None,
+    untouchables_a: list[str] | None = None,
+    untouchables_b: list[str] | None = None,
 ) -> list[dict]:
     """
     Find the most synergistic trades between team_a and team_b.
@@ -329,6 +337,11 @@ def find_optimal_trades(
       Stage 3  Exact lineup re-solve on top EXACT_CAP candidates  (ground truth)
 
     Always returns best-so-far if the deadline arrives mid-validation.
+
+    Parameters
+    ----------
+    untouchables_a : player names on team_a that must not be included in any trade
+    untouchables_b : player names on team_b that must not be included in any trade
 
     Each result dict:
       give_a      – list of player names team_a sends
@@ -374,6 +387,8 @@ def find_optimal_trades(
         pool_a_list, pool_b_list,
         marginals_a, marginals_b,
         max_players, salary_tol,
+        untouchables_a=set(untouchables_a or []),
+        untouchables_b=set(untouchables_b or []),
     )
 
     if not all_candidates:

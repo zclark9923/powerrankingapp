@@ -1439,7 +1439,37 @@ app.layout = html.Div(className="page-wrap", style={
 
             ], style={"display": "flex", "gap": "16px", "alignItems": "flex-end",
                       "background": C_CARD, "borderRadius": "12px",
-                      "padding": "20px", "marginBottom": "24px"}),
+                      "padding": "20px", "marginBottom": "12px"}),
+
+            # Untouchables row
+            html.Div([
+                html.Div([
+                    html.Label("Your Untouchables",
+                               style={"color": C_MUTED, "fontSize": "12px",
+                                      "marginBottom": "4px", "display": "block"}),
+                    dcc.Dropdown(
+                        id="opt-untouchables-a",
+                        options=[], value=[], multi=True,
+                        placeholder="Search your roster…",
+                        style={"color": "#0F172A"},
+                    ),
+                ], style={"flex": "1"}),
+
+                html.Div([
+                    html.Label("Their Untouchables",
+                               style={"color": C_MUTED, "fontSize": "12px",
+                                      "marginBottom": "4px", "display": "block"}),
+                    dcc.Dropdown(
+                        id="opt-untouchables-b",
+                        options=[], value=[], multi=True,
+                        placeholder="Select a specific opponent first…",
+                        disabled=True,
+                        style={"color": "#0F172A"},
+                    ),
+                ], style={"flex": "1"}),
+            ], style={"display": "flex", "gap": "16px",
+                      "background": C_CARD, "borderRadius": "12px",
+                      "padding": "16px 20px", "marginBottom": "24px"}),
 
             # Progress message
             html.Div(
@@ -2136,11 +2166,44 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 
 # ── Active-trade banner ────────────────────────────────────────────────────────────────
 
+# ── Populate untouchables dropdowns when team selection changes ───────────────
+@app.callback(
+    Output("opt-untouchables-a", "options"),
+    Output("opt-untouchables-a", "value"),
+    Output("opt-untouchables-b", "options"),
+    Output("opt-untouchables-b", "value"),
+    Output("opt-untouchables-b", "disabled"),
+    Output("opt-untouchables-b", "placeholder"),
+    Input("opt-team-a",        "value"),
+    Input("opt-team-b",        "value"),
+    State("proj-system-radio", "value"),
+    prevent_initial_call=False,
+)
+def update_untouchable_options(team_a, team_b, sys_val):
+    ctx_obj = _get_ctx(sys_val, None)
+    hf = ctx_obj.hit_full
+    pf = ctx_obj.pit_full
+
+    def _players_for(team):
+        names_h = hf[hf["Team"] == team]["Name"].dropna().tolist() if team else []
+        names_p = pf[pf["Team"] == team]["Name"].dropna().tolist() if team else []
+        all_names = sorted(set(names_h + names_p))
+        return [{"label": n, "value": n} for n in all_names]
+
+    opts_a = _players_for(team_a)
+    any_team = (team_b == "__ANY__")
+    opts_b = [] if any_team else _players_for(team_b)
+    placeholder_b = ("Select a specific opponent first…"
+                     if any_team else "Search their roster…")
+    return opts_a, [], opts_b, [], any_team, placeholder_b
+
+
 # ── Trade Optimizer callback ──────────────────────────────────────────────────
 # Shared computation + table-building logic used by both callback variants.
 
 def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
-                        set_progress=None, salary_tol=3):
+                        set_progress=None, salary_tol=3,
+                        untouchables_a=None, untouchables_b=None):
     """Run the optimizer and return (children, store_data)."""
     import time as _time
 
@@ -2188,6 +2251,8 @@ def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
             time_budget=remaining,
             salary_tol=salary_tol,
             progress_cb=_opp_progress,
+            untouchables_a=untouchables_a or [],
+            untouchables_b=untouchables_b or [],
         )
         for r in results:
             r["_opp"] = opp
@@ -2305,13 +2370,15 @@ if background_callback_manager is not None:
             Output("opt-results-store", "data"),
         ],
         inputs=[
-            Input("opt-run-btn",       "n_clicks"),
-            State("opt-team-a",        "value"),
-            State("opt-team-b",        "value"),
-            State("opt-max-players",   "value"),
-            State("opt-salary-tol",    "value"),
-            State("proj-system-radio", "value"),
-            State("trade-patch-store", "data"),
+            Input("opt-run-btn",          "n_clicks"),
+            State("opt-team-a",           "value"),
+            State("opt-team-b",           "value"),
+            State("opt-max-players",      "value"),
+            State("opt-salary-tol",       "value"),
+            State("opt-untouchables-a",   "value"),
+            State("opt-untouchables-b",   "value"),
+            State("proj-system-radio",    "value"),
+            State("trade-patch-store",    "data"),
         ],
         background=True,
         running=[
@@ -2326,13 +2393,17 @@ if background_callback_manager is not None:
         prevent_initial_call=True,
     )
     def run_trade_optimizer_bg(set_progress, n_clicks, team_a, team_b,
-                               max_players, salary_tol, sys_val, patch_data):
+                               max_players, salary_tol,
+                               untouchables_a, untouchables_b,
+                               sys_val, patch_data):
         if not n_clicks:
             return html.Div(), []
         try:
             return _run_optimizer_core(team_a, team_b, max_players,
                                        sys_val, patch_data, set_progress,
-                                       salary_tol=salary_tol or 3)
+                                       salary_tol=salary_tol or 3,
+                                       untouchables_a=untouchables_a,
+                                       untouchables_b=untouchables_b)
         except Exception as exc:
             return _opt_error_output(exc)
 
@@ -2341,23 +2412,28 @@ else:
     @app.callback(
         Output("opt-results",       "children"),
         Output("opt-results-store", "data"),
-        Input("opt-run-btn",       "n_clicks"),
-        State("opt-team-a",        "value"),
-        State("opt-team-b",        "value"),
-        State("opt-max-players",   "value"),
-        State("opt-salary-tol",    "value"),
-        State("proj-system-radio", "value"),
-        State("trade-patch-store", "data"),
+        Input("opt-run-btn",          "n_clicks"),
+        State("opt-team-a",           "value"),
+        State("opt-team-b",           "value"),
+        State("opt-max-players",      "value"),
+        State("opt-salary-tol",       "value"),
+        State("opt-untouchables-a",   "value"),
+        State("opt-untouchables-b",   "value"),
+        State("proj-system-radio",    "value"),
+        State("trade-patch-store",    "data"),
         prevent_initial_call=True,
     )
     def run_trade_optimizer_sync(n_clicks, team_a, team_b, max_players,
-                                 salary_tol, sys_val, patch_data):
+                                 salary_tol, untouchables_a, untouchables_b,
+                                 sys_val, patch_data):
         if not n_clicks:
             return html.Div(), []
         try:
             return _run_optimizer_core(team_a, team_b, max_players,
                                        sys_val, patch_data,
-                                       salary_tol=salary_tol or 3)
+                                       salary_tol=salary_tol or 3,
+                                       untouchables_a=untouchables_a,
+                                       untouchables_b=untouchables_b)
         except Exception as exc:
             return _opt_error_output(exc)
 

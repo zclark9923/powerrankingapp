@@ -2260,154 +2260,178 @@ def find_best_fa_pickups(n_clicks, team, sys_val, patch_data):
     if not n_clicks or not team:
         raise PreventUpdate
 
-    ctx_obj = _get_ctx(sys_val, patch_data)
-    hf = ctx_obj.hit_full.copy()
-    pf = ctx_obj.pit_full.copy()
+    def _err(msg):
+        return html.P(msg, style={"color": "#EF4444", "marginTop": "8px"}), []
 
-    if hf.empty or pf.empty:
-        return html.P("Roster data unavailable — re-run ottoneu_power_rankings.py.",
-                      style={"color": "#EF4444"}), []
-    if ctx_obj.fa_hit.empty and ctx_obj.fa_pit.empty:
-        return html.P("No FA pool data found in the workbook.",
-                      style={"color": C_MUTED}), []
+    try:
+        ctx_obj = _get_ctx(sys_val, patch_data)
+        hf = ctx_obj.hit_full.copy()
+        pf = ctx_obj.pit_full.copy()
 
-    baseline   = _calc_team_spts(team, hf, pf)
-    base_total = baseline["Total_SPTS"]
-    candidates = []
+        if hf.empty or pf.empty:
+            return _err(
+                "Roster data unavailable — re-run ottoneu_power_rankings.py and "
+                "commit the new ottoneu_power_rankings.xlsx to redeploy."
+            )
+        if ctx_obj.fa_hit.empty and ctx_obj.fa_pit.empty:
+            return _err(
+                "No FA pool data found in this workbook. "
+                "Re-run ottoneu_power_rankings.py to regenerate the file with FA sheets, "
+                "then commit the updated .xlsx to redeploy."
+            )
 
-    # ── Scan FA hitters ───────────────────────────────────────────────────
-    if not ctx_obj.fa_hit.empty:
-        fa_h = ctx_obj.fa_hit.copy()
-        fa_h["_spts"] = pd.to_numeric(fa_h["SPTS"]   if "SPTS"   in fa_h.columns else 0,
-                                      errors="coerce").fillna(0)
-        fa_h["_sal"]  = pd.to_numeric(fa_h["Salary"] if "Salary" in fa_h.columns else 0,
-                                      errors="coerce").fillna(0)
-        for _, row in fa_h.sort_values("_spts", ascending=False).head(_FA_SCAN_CAP).iterrows():
-            name   = str(row["Name"])
-            fa_row = ctx_obj.fa_hit[ctx_obj.fa_hit["Name"] == name].copy()
-            fa_row["Team"] = team
-            result = _calc_team_spts(team, pd.concat([hf, fa_row], ignore_index=True), pf)
-            delta  = round(result["Total_SPTS"] - base_total, 1)
-            if delta > 0:
-                candidates.append({
-                    "name":     name,
-                    "role":     "H",
-                    "pos":      str(row.get("Pos", "?")),
-                    "salary":   float(row["_sal"]),
-                    "raw_spts": float(row["_spts"]),
-                    "delta":    delta,
-                    "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
-                    "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
-                    "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
-                    "team":     team,
-                })
+        baseline   = _calc_team_spts(team, hf, pf)
+        base_total = baseline["Total_SPTS"]
+        candidates = []
 
-    # ── Scan FA pitchers ──────────────────────────────────────────────────
-    if not ctx_obj.fa_pit.empty:
-        fa_p = ctx_obj.fa_pit.copy()
-        for col in _TRADE_PIT_NUMS + ["Salary"]:
-            fa_p[col] = pd.to_numeric(fa_p[col] if col in fa_p.columns else 0,
-                                      errors="coerce").fillna(0)
-        fa_p["_spts"] = fa_p["SPTS"]
-        fa_p["_sal"]  = fa_p["Salary"]
-        for _, row in fa_p.sort_values("_spts", ascending=False).head(_FA_SCAN_CAP).iterrows():
-            name   = str(row["Name"])
-            role   = "RP" if (row["SV"] > 2 or row["HLD"] > 5 or row["IP"] < 70) else "SP"
-            fa_row = ctx_obj.fa_pit[ctx_obj.fa_pit["Name"] == name].copy()
-            fa_row["Team"] = team
-            for col in ("Ros_IP", "Ros_SV", "Ros_HLD"):
-                if col not in fa_row.columns:
-                    fa_row[col] = 0.0
-            result = _calc_team_spts(team, hf, pd.concat([pf, fa_row], ignore_index=True))
-            delta  = round(result["Total_SPTS"] - base_total, 1)
-            if delta > 0:
-                candidates.append({
-                    "name":     name,
-                    "role":     role,
-                    "pos":      role,
-                    "salary":   float(row["_sal"]),
-                    "raw_spts": float(row["_spts"]),
-                    "delta":    delta,
-                    "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
-                    "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
-                    "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
-                    "team":     team,
-                })
+        # ── Scan FA hitters ───────────────────────────────────────────────────
+        if not ctx_obj.fa_hit.empty:
+            fa_h = ctx_obj.fa_hit.copy()
+            fa_h["_spts"] = pd.to_numeric(
+                fa_h["SPTS"] if "SPTS" in fa_h.columns else pd.Series(0, index=fa_h.index),
+                errors="coerce").fillna(0)
+            fa_h["_sal"]  = pd.to_numeric(
+                fa_h["Salary"] if "Salary" in fa_h.columns else pd.Series(0, index=fa_h.index),
+                errors="coerce").fillna(0)
+            for _, row in fa_h.sort_values("_spts", ascending=False).head(_FA_SCAN_CAP).iterrows():
+                name   = str(row["Name"])
+                fa_row = ctx_obj.fa_hit[ctx_obj.fa_hit["Name"] == name].copy()
+                fa_row["Team"] = team
+                result = _calc_team_spts(team, pd.concat([hf, fa_row], ignore_index=True), pf)
+                delta  = round(result["Total_SPTS"] - base_total, 1)
+                if delta > 0:
+                    candidates.append({
+                        "name":     name,
+                        "role":     "H",
+                        "pos":      str(row.get("Pos", "?")),
+                        "salary":   float(row["_sal"]),
+                        "raw_spts": float(row["_spts"]),
+                        "delta":    delta,
+                        "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
+                        "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
+                        "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
+                        "team":     team,
+                    })
 
-    candidates.sort(key=lambda c: c["delta"], reverse=True)
-    top5 = candidates[:5]
+        # ── Scan FA pitchers ──────────────────────────────────────────────────
+        if not ctx_obj.fa_pit.empty:
+            fa_p = ctx_obj.fa_pit.copy()
+            for col in _TRADE_PIT_NUMS + ["Salary"]:
+                if col in fa_p.columns:
+                    fa_p[col] = pd.to_numeric(fa_p[col], errors="coerce").fillna(0)
+                else:
+                    fa_p[col] = 0.0
+            fa_p["_spts"] = fa_p["SPTS"]
+            fa_p["_sal"]  = fa_p["Salary"]
+            for _, row in fa_p.sort_values("_spts", ascending=False).head(_FA_SCAN_CAP).iterrows():
+                name   = str(row["Name"])
+                role   = "RP" if (row["SV"] > 2 or row["HLD"] > 5 or row["IP"] < 70) else "SP"
+                fa_row = ctx_obj.fa_pit[ctx_obj.fa_pit["Name"] == name].copy()
+                fa_row["Team"] = team
+                for col in ("Ros_IP", "Ros_SV", "Ros_HLD"):
+                    if col not in fa_row.columns:
+                        fa_row[col] = 0.0
+                result = _calc_team_spts(team, hf, pd.concat([pf, fa_row], ignore_index=True))
+                delta  = round(result["Total_SPTS"] - base_total, 1)
+                if delta > 0:
+                    candidates.append({
+                        "name":     name,
+                        "role":     role,
+                        "pos":      role,
+                        "salary":   float(row["_sal"]),
+                        "raw_spts": float(row["_spts"]),
+                        "delta":    delta,
+                        "d_hit":    round(result["Hit_SPTS"] - baseline["Hit_SPTS"], 1),
+                        "d_sp":     round(result["SP_SPTS"]  - baseline["SP_SPTS"],  1),
+                        "d_rp":     round(result["RP_SPTS"]  - baseline["RP_SPTS"],  1),
+                        "team":     team,
+                    })
 
-    if not top5:
-        return html.P(
-            "No FA pickups would positively contribute to the lineup after optimization. "
-            "The FA pool may be sparse or your roster is already well-optimised at all positions.",
-            style={"color": C_MUTED, "fontStyle": "italic", "marginTop": "8px"},
-        ), []
+        candidates.sort(key=lambda c: c["delta"], reverse=True)
+        top5 = candidates[:5]
 
-    role_clr = {"H": C_HIT, "SP": C_SP, "RP": C_RP}
-    cards = []
-    for i, c in enumerate(top5, 1):
-        rc = role_clr.get(c["role"], C_SP)
-        breakdown = "  ·  ".join(
-            f"{lbl} {'+' if v >= 0 else ''}{v:.1f}"
-            for lbl, v in [("Hit", c["d_hit"]), ("SP", c["d_sp"]), ("RP", c["d_rp"])]
-            if abs(v) > 0
+        if not top5:
+            return html.P(
+                "No FA pickups would positively contribute to the lineup after optimization. "
+                "The FA pool may be sparse or your roster is already well-optimised at all positions.",
+                style={"color": C_MUTED, "fontStyle": "italic", "marginTop": "8px"},
+            ), []
+
+        role_clr = {"H": C_HIT, "SP": C_SP, "RP": C_RP}
+        cards = []
+        for i, c in enumerate(top5, 1):
+            rc = role_clr.get(c["role"], C_SP)
+            breakdown = "  ·  ".join(
+                f"{lbl} {'+' if v >= 0 else ''}{v:.1f}"
+                for lbl, v in [("Hit", c["d_hit"]), ("SP", c["d_sp"]), ("RP", c["d_rp"])]
+                if abs(v) > 0
+            )
+            cards.append(html.Div([
+                html.Div([
+                    html.Span(str(i), style={
+                        "display": "inline-flex", "alignItems": "center",
+                        "justifyContent": "center", "width": "24px", "height": "24px",
+                        "borderRadius": "50%", "background": rc, "color": "#fff",
+                        "fontSize": "12px", "fontWeight": "700", "flexShrink": "0",
+                    }),
+                    html.Div([
+                        html.Span(c["name"],
+                                  style={"fontWeight": "700", "fontSize": "14px"}),
+                        html.Span(f"  {c['pos']}",
+                                  style={"color": rc, "fontSize": "12px", "marginLeft": "6px"}),
+                        html.Span(f"  ${c['salary']:.0f}",
+                                  style={"color": C_MUTED, "fontSize": "12px",
+                                         "marginLeft": "6px"}),
+                        html.Span(f"  {c['raw_spts']:.1f} proj SPTS",
+                                  style={"color": C_MUTED, "fontSize": "12px",
+                                         "marginLeft": "6px"}),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        html.Span(f"+{c['delta']:.1f}",
+                                  style={"color": "#22C55E", "fontWeight": "700",
+                                         "fontSize": "18px"}),
+                        html.Span(" SPTS",
+                                  style={"color": C_MUTED, "fontSize": "12px",
+                                         "marginLeft": "3px"}),
+                        html.Div(breakdown,
+                                 style={"color": C_MUTED, "fontSize": "11px",
+                                        "textAlign": "right"}),
+                    ], style={"textAlign": "right", "flexShrink": "0"}),
+                    html.Button("Apply pickup",
+                                 id={"type": "fa-apply-btn", "index": i},
+                                 n_clicks=0,
+                                 style={
+                                     "background": "transparent", "color": rc,
+                                     "border": f"1px solid {rc}", "borderRadius": "6px",
+                                     "padding": "6px 14px", "fontSize": "12px",
+                                     "cursor": "pointer", "whiteSpace": "nowrap",
+                                     "marginLeft": "12px", "flexShrink": "0",
+                                 }),
+                ], style={"display": "flex", "alignItems": "center", "gap": "12px"}),
+            ], style={
+                "background": C_BG, "borderRadius": "8px", "padding": "14px 16px",
+                "marginBottom": "10px", "border": f"1px solid {C_GRID}",
+            }))
+
+        footer = html.P(
+            f"Scanned top {_FA_SCAN_CAP} FA hitters + pitchers against {team}'s roster — "
+            f"showing top {len(top5)} of {len(candidates)} positive-delta pickups. "
+            "Click \u2018Apply pickup\u2019 to simulate the addition across all dashboard tabs.",
+            style={"color": C_MUTED, "fontSize": "11px",
+                   "marginTop": "12px", "textAlign": "center"},
         )
-        cards.append(html.Div([
-            html.Div([
-                html.Span(str(i), style={
-                    "display": "inline-flex", "alignItems": "center",
-                    "justifyContent": "center", "width": "24px", "height": "24px",
-                    "borderRadius": "50%", "background": rc, "color": "#fff",
-                    "fontSize": "12px", "fontWeight": "700", "flexShrink": "0",
-                }),
-                html.Div([
-                    html.Span(c["name"],
-                              style={"fontWeight": "700", "fontSize": "14px"}),
-                    html.Span(f"  {c['pos']}",
-                              style={"color": rc, "fontSize": "12px", "marginLeft": "6px"}),
-                    html.Span(f"  ${c['salary']:.0f}",
-                              style={"color": C_MUTED, "fontSize": "12px",
-                                     "marginLeft": "6px"}),
-                    html.Span(f"  {c['raw_spts']:.1f} proj SPTS",
-                              style={"color": C_MUTED, "fontSize": "12px",
-                                     "marginLeft": "6px"}),
-                ], style={"flex": "1"}),
-                html.Div([
-                    html.Span(f"+{c['delta']:.1f}",
-                              style={"color": "#22C55E", "fontWeight": "700",
-                                     "fontSize": "18px"}),
-                    html.Span(" SPTS",
-                              style={"color": C_MUTED, "fontSize": "12px",
-                                     "marginLeft": "3px"}),
-                    html.Div(breakdown,
-                             style={"color": C_MUTED, "fontSize": "11px",
-                                    "textAlign": "right"}),
-                ], style={"textAlign": "right", "flexShrink": "0"}),
-                html.Button("Apply pickup",
-                             id={"type": "fa-apply-btn", "index": i},
-                             n_clicks=0,
-                             style={
-                                 "background": "transparent", "color": rc,
-                                 "border": f"1px solid {rc}", "borderRadius": "6px",
-                                 "padding": "6px 14px", "fontSize": "12px",
-                                 "cursor": "pointer", "whiteSpace": "nowrap",
-                                 "marginLeft": "12px", "flexShrink": "0",
-                             }),
-            ], style={"display": "flex", "alignItems": "center", "gap": "12px"}),
-        ], style={
-            "background": C_BG, "borderRadius": "8px", "padding": "14px 16px",
-            "marginBottom": "10px", "border": f"1px solid {C_GRID}",
-        }))
+        return html.Div(cards + [footer]), top5
 
-    footer = html.P(
-        f"Scanned top {_FA_SCAN_CAP} FA hitters + pitchers against {team}'s roster — "
-        f"showing top {len(top5)} of {len(candidates)} positive-delta pickups. "
-        "Click \u2018Apply pickup\u2019 to simulate the addition across all dashboard tabs.",
-        style={"color": C_MUTED, "fontSize": "11px",
-               "marginTop": "12px", "textAlign": "center"},
-    )
-    return html.Div(cards + [footer]), top5
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        tb = traceback.format_exc()
+        return html.Div([
+            html.P(f"\u26a0\ufe0f FA scan error: {exc}",
+                   style={"color": "#EF4444", "fontWeight": "700", "marginTop": "8px"}),
+            html.Pre(tb, style={"color": C_MUTED, "fontSize": "10px",
+                                "whiteSpace": "pre-wrap", "maxHeight": "200px",
+                                "overflowY": "auto", "marginTop": "6px"}),
+        ]), []
 
 
 @app.callback(

@@ -2095,37 +2095,56 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
     prevent_initial_call=True,
 )
 def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_data):
+    import time as _time
     if not n_clicks:
         return html.Div(), []
 
-    ctx_obj = _get_ctx(sys_val, patch_data)
-    hf = ctx_obj.hit_full.copy()
-    pf = ctx_obj.pit_full.copy()
+    try:
+        ctx_obj = _get_ctx(sys_val, patch_data)
+        hf = ctx_obj.hit_full.copy()
+        pf = ctx_obj.pit_full.copy()
 
-    # Determine which teams to search against
-    all_teams = [t for t in teams if t != team_a]
-    search_teams = all_teams if team_b == "__ANY__" else [team_b]
+        # Determine which teams to search against
+        all_teams = [t for t in teams if t != team_a]
+        search_teams = all_teams if team_b == "__ANY__" else [team_b]
 
-    all_results: list[dict] = []
+        all_results: list[dict] = []
+        deadline = _time.time() + 22  # bail at 22s, well inside Render's 30s limit
 
-    for opp in search_teams:
-        results = find_optimal_trades(
-            team_a, opp, hf, pf,
-            summary=ctx_obj.summary,
-            max_players=max_players,
-            top_n=10,
-        )
-        for r in results:
-            r["_opp"] = opp
-        all_results.extend(results)
+        for opp in search_teams:
+            if _time.time() > deadline:
+                break
+            results = find_optimal_trades(
+                team_a, opp, hf, pf,
+                summary=ctx_obj.summary,
+                max_players=max_players,
+                top_n=10,
+            )
+            for r in results:
+                r["_opp"] = opp
+            all_results.extend(results)
 
-    if not all_results:
-        return (html.P("No salary-balanced trades found.",
-                       style={"color": C_MUTED, "textAlign": "center", "marginTop": "20px"}),
-                [])
+        timed_out = _time.time() > deadline
 
-    all_results.sort(key=lambda r: r["total_delta"], reverse=True)
-    top = all_results[:15]
+        if not all_results:
+            msg = ("No salary-balanced trades found — try relaxing the max players setting "
+                   "or selecting a specific opponent team.")
+            return (html.P(msg, style={"color": C_MUTED, "textAlign": "center",
+                                       "marginTop": "20px"}), [])
+
+        all_results.sort(key=lambda r: r["total_delta"], reverse=True)
+        top = all_results[:15]
+
+    except Exception as exc:
+        return (html.Div([
+            html.P("⚠ Optimizer error — see details below.",
+                   style={"color": "#F87171", "fontWeight": "700", "marginBottom": "8px"}),
+            html.Pre(str(exc),
+                     style={"color": C_MUTED, "fontSize": "11px",
+                            "whiteSpace": "pre-wrap", "wordBreak": "break-all"}),
+        ], style={"background": C_CARD, "borderRadius": "8px",
+                  "padding": "16px", "marginTop": "16px"}),
+        [])
 
     # Build results table
     def _sign(v):
@@ -2238,6 +2257,11 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
             f"Salary tolerance \u00b1$3  \u00b7  Click \u2018Apply\u2019 to simulate on the full dashboard",
             style={"color": C_MUTED, "fontSize": "12px", "marginBottom": "12px"},
         ),
+        (html.P(
+            "\u23f1 Time budget reached — results are partial. "
+            "Select a specific opponent team for a complete search.",
+            style={"color": C_RP, "fontSize": "12px", "marginBottom": "8px"},
+        ) if timed_out else None),
         html.Div(table, style={
             "background": C_CARD, "borderRadius": "12px",
             "padding": "4px", "overflowX": "auto",

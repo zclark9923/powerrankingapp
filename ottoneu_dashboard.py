@@ -1347,7 +1347,15 @@ app.layout = html.Div(className="page-wrap", style={
                 "salary-valid player combination to surface trades where both sides gain.  "
                 "1 player/side + specific opponent ≈ 2–5 s.  "
                 "2 players/side + Any Team ≈ 30–60 s.",
-                style={"color": C_MUTED, "fontSize": "13px", "marginBottom": "20px"},
+                style={"color": C_MUTED, "fontSize": "13px", "marginBottom": "8px"},
+            ),
+
+            html.P(
+                "💡 If you've simulated a trade in the Trade Machine tab, the optimizer "
+                "automatically uses those updated rosters — the ⚠️ banner above confirms "
+                "when simulated rosters are active.",
+                style={"color": C_MUTED, "fontSize": "12px",
+                       "fontStyle": "italic", "marginBottom": "20px"},
             ),
 
             # Controls row
@@ -2179,10 +2187,11 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
     Input("opt-team-a",        "value"),
     Input("opt-team-b",        "value"),
     State("proj-system-radio", "value"),
+    State("trade-patch-store", "data"),
     prevent_initial_call=False,
 )
-def update_untouchable_options(team_a, team_b, sys_val):
-    ctx_obj = _get_ctx(sys_val, None)
+def update_untouchable_options(team_a, team_b, sys_val, patch_data):
+    ctx_obj = _get_ctx(sys_val, patch_data)
     hf = ctx_obj.hit_full
     pf = ctx_obj.pit_full
 

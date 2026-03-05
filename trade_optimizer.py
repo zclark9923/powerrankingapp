@@ -152,7 +152,8 @@ def find_optimal_trades(
     max_players: int = 2,
     top_n: int = 10,
     salary_tol: float = SALARY_TOLERANCE,
-    progress_cb=None,          # optional callable(pct_float, message_str)
+    time_budget: float = 20.0,       # hard wall in seconds — always respected
+    progress_cb=None,
 ) -> list[dict]:
     """
     Search all salary-balanced trade combos between team_a and team_b,
@@ -170,6 +171,7 @@ def find_optimal_trades(
     """
     max_players = min(max_players, MAX_TRADE_SIZE)
     t0 = time.time()
+    deadline = t0 + time_budget
 
     # ── Baseline ──────────────────────────────────────────────────────────────
     baseline_a = _team_spts_exact(team_a, hit_full, pit_full)
@@ -214,7 +216,7 @@ def find_optimal_trades(
                         "_approx":  _approx_score(list(combo_a), list(combo_b)),
                     })
                     _gen_count += 1
-                    if _gen_count >= GEN_CAP:
+                    if _gen_count >= GEN_CAP or time.time() >= deadline:
                         _gen_limit_hit = True
                         break
 
@@ -233,6 +235,8 @@ def find_optimal_trades(
     n = len(to_validate)
 
     for i, cand in enumerate(to_validate):
+        if time.time() >= deadline:
+            break   # return whatever we have so far
         names_a = [p["Name"] for p in cand["give_a"]]
         names_b = [p["Name"] for p in cand["give_b"]]
 

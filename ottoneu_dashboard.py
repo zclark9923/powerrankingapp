@@ -2139,6 +2139,8 @@ def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
     n_opps = len(search_teams)
 
     all_results: list[dict] = []
+    # Divide 20-second hard budget evenly across opponents (min 3 s each)
+    per_opp_budget = max(3.0, 20.0 / n_opps)
     for idx, opp in enumerate(search_teams):
         _prog(f"Searching {opp} ({idx + 1}/{n_opps})\u2026")
         results = find_optimal_trades(
@@ -2146,6 +2148,7 @@ def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
             summary=ctx_obj.summary,
             max_players=max_players,
             top_n=10,
+            time_budget=per_opp_budget,
         )
         for r in results:
             r["_opp"] = opp

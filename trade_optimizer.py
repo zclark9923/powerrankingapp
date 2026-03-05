@@ -34,8 +34,10 @@ warnings.filterwarnings("ignore")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 SALARY_TOLERANCE  = 3      # max $ imbalance allowed per side
-APPROX_PREFILTER  = 400    # max candidates to validate with full optimizer
+APPROX_PREFILTER  = 75     # max candidates to validate with full optimizer
 MAX_TRADE_SIZE    = 3      # hard cap: players per side
+POOL_TOP_N        = 25     # only consider each team's top-N players by SPTS
+GEN_CAP           = 5_000  # stop generating combos after this many salary-valid hits
 _SLOT_G_CAP       = 140    # copy of pipeline constant (avoid circular import)
 _HIT_KEEP = ["Name", "Pos", "SPTS", "SPTS/G", "AB", "H", "2B",
              "BB", "HR", "SB", "wOBA", "OPS"]
@@ -183,15 +185,21 @@ def find_optimal_trades(
     if pool_a.empty or pool_b.empty:
         return []
 
-    pool_a_list = pool_a.to_dict("records")
-    pool_b_list = pool_b.to_dict("records")
+    pool_a_list = pool_a.sort_values("SPTS", ascending=False).head(POOL_TOP_N).to_dict("records")
+    pool_b_list = pool_b.sort_values("SPTS", ascending=False).head(POOL_TOP_N).to_dict("records")
 
     # ── Generate salary-valid combinations ────────────────────────────────────
     all_candidates: list[dict] = []
+    _gen_count = 0
+    _gen_limit_hit = False
 
     for k_a in range(1, max_players + 1):
         for k_b in range(1, max_players + 1):
+            if _gen_limit_hit:
+                break
             for combo_a in combinations(pool_a_list, k_a):
+                if _gen_limit_hit:
+                    break
                 sal_a = sum(p["Salary"] for p in combo_a)
                 for combo_b in combinations(pool_b_list, k_b):
                     sal_b = sum(p["Salary"] for p in combo_b)
@@ -205,6 +213,10 @@ def find_optimal_trades(
                         "sal_diff": round(sal_a - sal_b, 0),
                         "_approx":  _approx_score(list(combo_a), list(combo_b)),
                     })
+                    _gen_count += 1
+                    if _gen_count >= GEN_CAP:
+                        _gen_limit_hit = True
+                        break
 
     if not all_candidates:
         return []

@@ -26,7 +26,7 @@ from trade_optimizer import find_optimal_trades
 # Background callback manager — initialised once, safely, after gunicorn has
 # forked its workers (wrapped in try/except so a failure doesn't crash startup).
 try:
-    _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dash_cache")
+    _CACHE_DIR = "/tmp/.dash_cache"
     os.makedirs(_CACHE_DIR, exist_ok=True)
     _cache = diskcache.Cache(_CACHE_DIR)
     background_callback_manager = DiskcacheManager(_cache)
@@ -1344,7 +1344,9 @@ app.layout = html.Div(className="page-wrap", style={
             html.P(
                 "Find the most synergistic trades between two teams. "
                 "The optimizer runs the full lineup + pitching solver on every "
-                "salary-valid player combination to surface trades where both sides gain.",
+                "salary-valid player combination to surface trades where both sides gain.  "
+                "1 player/side + specific opponent ≈ 2–5 s.  "
+                "2 players/side + Any Team ≈ 30–60 s.",
                 style={"color": C_MUTED, "fontSize": "13px", "marginBottom": "20px"},
             ),
 
@@ -1385,7 +1387,7 @@ app.layout = html.Div(className="page-wrap", style={
                         options=[{"label": "1", "value": 1},
                                  {"label": "2", "value": 2},
                                  {"label": "3", "value": 3}],
-                        value=2,
+                        value=1,
                         inline=True,
                         inputStyle={"marginRight": "4px"},
                         labelStyle={"marginRight": "16px",

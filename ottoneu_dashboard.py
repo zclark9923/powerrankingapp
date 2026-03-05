@@ -1860,7 +1860,7 @@ def _get_ctx(sys_val: str, patch_data) -> SysCtx:
 
 
 _FA_POOL_LIMIT = 150   # max FA players shown in the picker (already sorted by SPTS)
-_FA_SCAN_CAP  = 100   # max FA players evaluated by the Best FA Pickups scanner (by raw SPTS)
+_FA_SCAN_CAP  = 200   # max FA players evaluated by the Best FA Pickups scanner (combined H+P, by raw SPTS)
 
 
 def _fmt_hit_opts(df: pd.DataFrame) -> pd.DataFrame:
@@ -2284,16 +2284,39 @@ def find_best_fa_pickups(n_clicks, team, sys_val, patch_data):
         base_total = baseline["Total_SPTS"]
         candidates = []
 
+        # ── Pre-compute cheap thresholds to skip non-viable FAs before optimizer ──
+        # Hitter threshold: FA's SPTS/G must beat the team's bottom-quartile hitter
+        _team_h = hf[hf["Team"] == team]
+        _team_h_spg = pd.to_numeric(
+            _team_h["SPTS/G"] if "SPTS/G" in _team_h.columns else pd.Series(dtype=float),
+            errors="coerce").dropna()
+        _hit_thresh = (float(_team_h_spg.quantile(0.25)) * 0.85
+                       if not _team_h_spg.empty else 0.0)
+
+        # Pitcher threshold: FA's SPTS must beat the team's bottom-quartile pitcher
+        _team_p = pf[pf["Team"] == team]
+        _team_p_spts = pd.to_numeric(
+            _team_p["SPTS"] if "SPTS" in _team_p.columns else pd.Series(dtype=float),
+            errors="coerce").dropna()
+        _pit_thresh = (float(_team_p_spts.quantile(0.25)) * 0.80
+                       if not _team_p_spts.empty else 0.0)
+
         # ── Scan FA hitters ───────────────────────────────────────────────────
         if not ctx_obj.fa_hit.empty:
             fa_h = ctx_obj.fa_hit.copy()
             fa_h["_spts"] = pd.to_numeric(
                 fa_h["SPTS"] if "SPTS" in fa_h.columns else pd.Series(0, index=fa_h.index),
                 errors="coerce").fillna(0)
+            fa_h["_spg"] = pd.to_numeric(
+                fa_h["SPTS/G"] if "SPTS/G" in fa_h.columns else pd.Series(0, index=fa_h.index),
+                errors="coerce").fillna(0)
             fa_h["_sal"]  = pd.to_numeric(
                 fa_h["Salary"] if "Salary" in fa_h.columns else pd.Series(0, index=fa_h.index),
                 errors="coerce").fillna(0)
-            for _, row in fa_h.sort_values("_spts", ascending=False).head(_FA_SCAN_CAP).iterrows():
+            # Pre-filter: skip FAs that can't possibly improve the worst lineup slot
+            fa_h = fa_h[fa_h["_spg"] >= _hit_thresh]
+            _h_cap = max(1, _FA_SCAN_CAP // 2)  # up to half the cap for hitters
+            for _, row in fa_h.sort_values("_spts", ascending=False).head(_h_cap).iterrows():
                 name   = str(row["Name"])
                 fa_row = ctx_obj.fa_hit[ctx_obj.fa_hit["Name"] == name].copy()
                 fa_row["Team"] = team
@@ -2323,7 +2346,10 @@ def find_best_fa_pickups(n_clicks, team, sys_val, patch_data):
                     fa_p[col] = 0.0
             fa_p["_spts"] = fa_p["SPTS"]
             fa_p["_sal"]  = fa_p["Salary"]
-            for _, row in fa_p.sort_values("_spts", ascending=False).head(_FA_SCAN_CAP).iterrows():
+            # Pre-filter: skip pitchers below the team's bottom-quartile pitcher threshold
+            fa_p = fa_p[fa_p["_spts"] >= _pit_thresh]
+            _p_cap = max(1, _FA_SCAN_CAP // 2)  # up to half the cap for pitchers
+            for _, row in fa_p.sort_values("_spts", ascending=False).head(_p_cap).iterrows():
                 name   = str(row["Name"])
                 role   = "RP" if (row["SV"] > 2 or row["HLD"] > 5 or row["IP"] < 70) else "SP"
                 fa_row = ctx_obj.fa_pit[ctx_obj.fa_pit["Name"] == name].copy()

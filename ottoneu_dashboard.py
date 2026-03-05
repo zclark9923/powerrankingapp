@@ -42,6 +42,7 @@ XLSX_PATH = Path(__file__).parent / "ottoneu_power_rankings.xlsx"
 C_HIT  = "#3B82F6"   # blue
 C_SP   = "#10B981"   # green
 C_RP   = "#F59E0B"   # amber
+C_AMBER = "#F59E0B"  # alias used by FA Pickups / Trade Machine UI
 C_BG   = "#0F172A"   # dark navy background
 C_CARD = "#1E293B"   # card background
 C_TEXT = "#F1F5F9"   # light text

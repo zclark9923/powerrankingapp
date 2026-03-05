@@ -38,6 +38,7 @@ APPROX_PREFILTER  = 75     # max candidates to validate with full optimizer
 MAX_TRADE_SIZE    = 3      # hard cap: players per side
 POOL_TOP_N        = 25     # only consider each team's top-N players by SPTS
 GEN_CAP           = 5_000  # stop generating combos after this many salary-valid hits
+RAW_SPTS_GATE     = 20     # skip combos where either side loses >20 raw SPTS
 _SLOT_G_CAP       = 140    # copy of pipeline constant (avoid circular import)
 _HIT_KEEP = ["Name", "Pos", "SPTS", "SPTS/G", "AB", "H", "2B",
              "BB", "HR", "SB", "wOBA", "OPS"]
@@ -126,16 +127,13 @@ def _apply_swap(hf: pd.DataFrame, pf: pd.DataFrame,
 
 def _approx_score(give_a: list[dict], give_b: list[dict]) -> float:
     """
-    Fast approximation of total synergy:  what each side gains in raw SPTS.
-    Useful only for pre-filtering — does not account for positional constraints.
+    Fast sort key for pre-filtering candidates.
+    Returns the minimum of both sides' raw SPTS gain (higher = better for both).
+    Lopsided combos where either side loses >RAW_SPTS_GATE SPTS are already
+    skipped at generation time before this is ever called.
     """
-    # Each side's approximate gain = sum SPTS received − sum SPTS given
-    # Total net ≈ 0 in raw terms, so we score by |individual gains| to surface
-    # imbalanced swaps of surplus players.  Better metric: the minimum of the
-    # two unilateral deltas (both teams must benefit or at worst be neutral).
     raw_a = sum(p["SPTS"] for p in give_b) - sum(p["SPTS"] for p in give_a)
     raw_b = sum(p["SPTS"] for p in give_a) - sum(p["SPTS"] for p in give_b)
-    # Prioritise trades where the worse-off team loses as little as possible
     return min(raw_a, raw_b)
 
 
@@ -207,6 +205,14 @@ def find_optimal_trades(
                     sal_b = sum(p["Salary"] for p in combo_b)
                     if abs(sal_a - sal_b) > salary_tol:
                         continue
+                    # Skip combos where either side loses more than RAW_SPTS_GATE
+                    # raw SPTS — positional fit cannot recover a deficit that large.
+                    spts_a = sum(p["SPTS"] for p in combo_a)
+                    spts_b = sum(p["SPTS"] for p in combo_b)
+                    if (spts_b - spts_a) < -RAW_SPTS_GATE:  # A loses too much in raw SPTS
+                        continue
+                    if (spts_a - spts_b) < -RAW_SPTS_GATE:  # B loses too much in raw SPTS
+                        continue
                     all_candidates.append({
                         "give_a":   list(combo_a),
                         "give_b":   list(combo_b),
@@ -251,7 +257,10 @@ def find_optimal_trades(
         delta_b = round(new_b - baseline_b, 1)
         total   = round(delta_a + delta_b, 1)
 
-        # Both teams must not lose more than their own total SPTS (sanity)
+        # Skip trades that hurt either side
+        if delta_a < 0 or delta_b < 0:
+            continue
+
         scored.append({
             "give_a":        names_a,
             "give_b":        names_b,

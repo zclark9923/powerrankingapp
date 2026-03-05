@@ -13,14 +13,19 @@ Then open http://127.0.0.1:8050 in your browser.
 """
 
 import os
+import diskcache
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from dash import Dash, dcc, html, Input, Output, State, dash_table, ctx as dash_ctx, ALL
+from dash import Dash, dcc, html, Input, Output, State, dash_table, ctx as dash_ctx, ALL, DiskcacheManager
 from dash.exceptions import PreventUpdate
 from pathlib import Path
 from ottoneu_power_rankings import optimal_lineup_spts, constrained_pitcher_spts, recompute_from_rosters
 from trade_optimizer import find_optimal_trades
+
+# Background callback manager (lets optimizer run past Render's 30s HTTP timeout)
+_cache = diskcache.Cache("/tmp/dash_optimizer_cache")
+background_callback_manager = DiskcacheManager(_cache)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Relative path so the app works both locally and when deployed
@@ -1046,6 +1051,7 @@ _TAB_SEL = {
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 app = Dash(__name__, title="Ottoneu Power Rankings",
+          background_callback_manager=background_callback_manager,
           meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
 
 app.layout = html.Div(className="page-wrap", style={
@@ -1389,11 +1395,32 @@ app.layout = html.Div(className="page-wrap", style={
                             "whiteSpace": "nowrap",
                         },
                     ),
+                    html.Button(
+                        "Cancel",
+                        id="opt-cancel-btn", n_clicks=0, disabled=True,
+                        style={
+                            "background": "transparent", "color": C_MUTED,
+                            "border": f"1px solid {C_GRID}", "borderRadius": "8px",
+                            "padding": "10px 16px", "fontSize": "13px",
+                            "cursor": "pointer", "whiteSpace": "nowrap",
+                            "marginLeft": "8px",
+                        },
+                    ),
                 ], style={"flex": "none"}),
 
             ], style={"display": "flex", "gap": "16px", "alignItems": "flex-end",
                       "background": C_CARD, "borderRadius": "12px",
                       "padding": "20px", "marginBottom": "24px"}),
+
+            # Progress message
+            html.Div(
+                id="opt-progress-div",
+                style={"display": "none", "marginBottom": "12px"},
+                children=[
+                    html.Span(id="opt-progress-msg",
+                              style={"color": C_MUTED, "fontSize": "12px"}),
+                ],
+            ),
 
             # Results
             dcc.Loading(
@@ -2084,18 +2111,31 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 
 
 @app.callback(
-    Output("opt-results",       "children"),
-    Output("opt-results-store", "data"),
-    Input("opt-run-btn", "n_clicks"),
-    State("opt-team-a",      "value"),
-    State("opt-team-b",      "value"),
-    State("opt-max-players", "value"),
-    State("proj-system-radio", "value"),
-    State("trade-patch-store", "data"),
+    output=[
+        Output("opt-results",       "children"),
+        Output("opt-results-store", "data"),
+    ],
+    inputs=[
+        Input("opt-run-btn", "n_clicks"),
+        State("opt-team-a",        "value"),
+        State("opt-team-b",        "value"),
+        State("opt-max-players",   "value"),
+        State("proj-system-radio", "value"),
+        State("trade-patch-store", "data"),
+    ],
+    background=True,
+    running=[
+        (Output("opt-run-btn",      "disabled"), True,  False),
+        (Output("opt-cancel-btn",   "disabled"), False, True),
+        (Output("opt-progress-div", "style"),
+         {"display": "block", "marginBottom": "12px"},
+         {"display": "none"}),
+    ],
+    cancel=[Input("opt-cancel-btn", "n_clicks")],
+    progress=Output("opt-progress-msg", "children"),
     prevent_initial_call=True,
 )
-def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_data):
-    import time as _time
+def run_trade_optimizer(set_progress, n_clicks, team_a, team_b, max_players, sys_val, patch_data):
     if not n_clicks:
         return html.Div(), []
 
@@ -2104,16 +2144,14 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
         hf = ctx_obj.hit_full.copy()
         pf = ctx_obj.pit_full.copy()
 
-        # Determine which teams to search against
         all_teams = [t for t in teams if t != team_a]
         search_teams = all_teams if team_b == "__ANY__" else [team_b]
 
         all_results: list[dict] = []
-        deadline = _time.time() + 22  # bail at 22s, well inside Render's 30s limit
+        n_opps = len(search_teams)
 
-        for opp in search_teams:
-            if _time.time() > deadline:
-                break
+        for idx, opp in enumerate(search_teams):
+            set_progress(f"Searching {opp} ({idx + 1}/{n_opps})…")
             results = find_optimal_trades(
                 team_a, opp, hf, pf,
                 summary=ctx_obj.summary,
@@ -2124,7 +2162,7 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
                 r["_opp"] = opp
             all_results.extend(results)
 
-        timed_out = _time.time() > deadline
+        set_progress("Ranking results…")
 
         if not all_results:
             msg = ("No salary-balanced trades found — try relaxing the max players setting "
@@ -2257,11 +2295,6 @@ def run_trade_optimizer(n_clicks, team_a, team_b, max_players, sys_val, patch_da
             f"Salary tolerance \u00b1$3  \u00b7  Click \u2018Apply\u2019 to simulate on the full dashboard",
             style={"color": C_MUTED, "fontSize": "12px", "marginBottom": "12px"},
         ),
-        (html.P(
-            "\u23f1 Time budget reached — results are partial. "
-            "Select a specific opponent team for a complete search.",
-            style={"color": C_RP, "fontSize": "12px", "marginBottom": "8px"},
-        ) if timed_out else None),
         html.Div(table, style={
             "background": C_CARD, "borderRadius": "12px",
             "padding": "4px", "overflowX": "auto",

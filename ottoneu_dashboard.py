@@ -68,7 +68,8 @@ class SysCtx:
 
     def __init__(self, sys_name: str,
                  raw_summary, raw_hitters, raw_sp, raw_rp, raw_roster,
-                 raw_hit_full=None, raw_pit_full=None):
+                 raw_hit_full=None, raw_pit_full=None,
+                 raw_fa_hit=None, raw_pit_fa=None):
         for _df in (raw_summary, raw_hitters, raw_sp, raw_rp, raw_roster):
             if "Team" in _df.columns:
                 _df["Team"] = _df["Team"].replace(TEAM_NAMES)
@@ -83,6 +84,8 @@ class SysCtx:
         self.roster_data = raw_roster
         self.hit_full    = raw_hit_full if raw_hit_full is not None else pd.DataFrame()
         self.pit_full    = raw_pit_full if raw_pit_full is not None else pd.DataFrame()
+        self.fa_hit      = raw_fa_hit   if raw_fa_hit   is not None else pd.DataFrame()
+        self.fa_pit      = raw_pit_fa   if raw_pit_fa   is not None else pd.DataFrame()
         self.teams       = raw_summary["Team"].tolist()
         self.has_salary  = all(c in raw_summary.columns
                                for c in ["Total_Salary", "Avg_Age", "Sal_Hit", "Sal_SP", "Sal_RP"])
@@ -148,7 +151,8 @@ def _load_sys(display_name: str) -> SysCtx:
                   _rd(f"{safe}_Summary"), _rd(f"{safe}_Hitters"),
                   _rd(f"{safe}_SP_Detail"), _rd(f"{safe}_RP_Detail"),
                   _rd(f"{safe}_Roster"),
-                  _rd(f"{safe}_Hit_Roster"), _rd(f"{safe}_Pit_Roster"))
+                  _rd(f"{safe}_Hit_Roster"), _rd(f"{safe}_Pit_Roster"),
+                  _rd(f"{safe}_FA_Hit"),    _rd(f"{safe}_FA_Pit"))
 
 
 _ALL_CTX: dict = {s: _load_sys(s) for s in _AVAIL_SYSTEMS}
@@ -1207,12 +1211,12 @@ app.layout = html.Div(className="page-wrap", style={
                 children=[
 
             html.P(
-                "Select up to 3 players per side to swap, then click Evaluate Trade. "
-                "The optimizer re-runs full lineup and pitching constraints for both teams.",
+                "Simulate a trade, free-agent pickup, or roster drop. "
+                "Select ‘Free Agents’ as a team to add FA players without giving up anything. "
+                "Up to 3 players per side. Drops are removed before optimization regardless of trade.",
                 style={"color": C_MUTED, "fontSize": "13px", "marginBottom": "20px"},
             ),
 
-            # ── Two-sided picker ─────────────────────────────────────────
             html.Div([
 
                 # Side A
@@ -1223,32 +1227,48 @@ app.layout = html.Div(className="page-wrap", style={
                     html.Label("Team", style={"color": C_MUTED, "fontSize": "12px",
                                "marginBottom": "4px", "display": "block"}),
                     dcc.Dropdown(id="trade-team-a",
-                                 options=[{"label": t, "value": t} for t in teams],
+                                 options=[{"label": "— Free Agents —", "value": "__FA__"}] +
+                                         [{"label": t, "value": t} for t in teams],
                                  value=teams[0], clearable=False,
                                  style={"color": "#0F172A", "marginBottom": "14px"}),
-                    html.Label("Players to send away (up to 3)",
-                               style={"color": C_MUTED, "fontSize": "12px",
-                                      "marginBottom": "4px", "display": "block"}),
+                    html.Div(id="trade-label-a",
+                             children="Players to trade away (up to 3)",
+                             style={"color": C_MUTED, "fontSize": "12px", "marginBottom": "4px"}),
                     dcc.Dropdown(id="trade-players-a", multi=True, placeholder="Select players…",
-                                 style={"color": "#0F172A"}),
+                                 style={"color": "#0F172A", "marginBottom": "14px"}),
+                    html.Div(id="trade-drop-wrap-a", children=[
+                        html.Label("Also drop from this roster (optional)",
+                                   style={"color": C_MUTED, "fontSize": "12px",
+                                          "marginBottom": "4px", "display": "block"}),
+                        dcc.Dropdown(id="trade-drop-a", multi=True,
+                                     placeholder="Select players to drop…",
+                                     style={"color": "#0F172A"}),
+                    ]),
                 ], style={"flex": "1", "background": C_CARD, "borderRadius": "12px",
                           "padding": "20px"}),
 
-                # Middle
+                # Middle controls
                 html.Div([
                     html.Div("⇄", style={"fontSize": "28px", "color": C_MUTED,
-                                         "marginBottom": "16px"}),
-                    html.Button("Evaluate Trade", id="trade-evaluate-btn", n_clicks=0,
+                                          "marginBottom": "12px"}),
+                    html.Button("Evaluate", id="trade-evaluate-btn", n_clicks=0,
                                 style={
                                     "background": C_SP, "color": "#fff",
                                     "border": "none", "borderRadius": "8px",
                                     "padding": "10px 20px", "fontSize": "13px",
                                     "fontWeight": "700", "cursor": "pointer",
-                                    "whiteSpace": "nowrap",
+                                    "whiteSpace": "nowrap", "marginBottom": "8px",
+                                }),
+                    html.Button("Reset", id="trade-reset-btn", n_clicks=0,
+                                style={
+                                    "background": "transparent", "color": C_MUTED,
+                                    "border": "1px solid #334155", "borderRadius": "8px",
+                                    "padding": "8px 16px", "fontSize": "12px",
+                                    "cursor": "pointer", "whiteSpace": "nowrap",
                                 }),
                 ], style={"display": "flex", "flexDirection": "column",
                           "alignItems": "center", "justifyContent": "center",
-                          "padding": "0 20px", "gap": "8px"}),
+                          "padding": "0 20px", "gap": "4px"}),
 
                 # Side B
                 html.Div([
@@ -1258,22 +1278,30 @@ app.layout = html.Div(className="page-wrap", style={
                     html.Label("Team", style={"color": C_MUTED, "fontSize": "12px",
                                "marginBottom": "4px", "display": "block"}),
                     dcc.Dropdown(id="trade-team-b",
-                                 options=[{"label": t, "value": t} for t in teams],
+                                 options=[{"label": "— Free Agents —", "value": "__FA__"}] +
+                                         [{"label": t, "value": t} for t in teams],
                                  value=teams[1] if len(teams) > 1 else teams[0],
                                  clearable=False,
                                  style={"color": "#0F172A", "marginBottom": "14px"}),
-                    html.Label("Players to send away (up to 3)",
-                               style={"color": C_MUTED, "fontSize": "12px",
-                                      "marginBottom": "4px", "display": "block"}),
+                    html.Div(id="trade-label-b",
+                             children="Players to trade away (up to 3)",
+                             style={"color": C_MUTED, "fontSize": "12px", "marginBottom": "4px"}),
                     dcc.Dropdown(id="trade-players-b", multi=True, placeholder="Select players…",
-                                 style={"color": "#0F172A"}),
+                                 style={"color": "#0F172A", "marginBottom": "14px"}),
+                    html.Div(id="trade-drop-wrap-b", children=[
+                        html.Label("Also drop from this roster (optional)",
+                                   style={"color": C_MUTED, "fontSize": "12px",
+                                          "marginBottom": "4px", "display": "block"}),
+                        dcc.Dropdown(id="trade-drop-b", multi=True,
+                                     placeholder="Select players to drop…",
+                                     style={"color": "#0F172A"}),
+                    ]),
                 ], style={"flex": "1", "background": C_CARD, "borderRadius": "12px",
                           "padding": "20px"}),
 
             ], style={"display": "flex", "gap": "16px", "alignItems": "stretch",
                       "marginBottom": "28px"}),
 
-            # ── Results ──────────────────────────────────────────────────
             html.Div(id="trade-result"),
         ]),
     ]),
@@ -1479,61 +1507,119 @@ def update_salary_figs(sys_val: str):
             build_age_bar_fig(ctx))
 
 
-# ── Trade Machine helpers ─────────────────────────────────────────────────────
+# ── Trade Machine constants + helpers ────────────────────────────────────────
+
+_FA_TEAM = "__FA__"
+
 
 def _trade_player_options(team: str, ctx) -> list:
-    """Build dropdown options for all players on a team (hitters + pitchers)."""
-    if team is None:
+    """Roster options for a real team, or FA pool when team == _FA_TEAM."""
+    if not team:
         return []
-    options = []
-    if not ctx.hit_full.empty and "Team" in ctx.hit_full.columns:
-        for _, row in ctx.hit_full[ctx.hit_full["Team"] == team].iterrows():
-            spts = pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0
-            pos  = row.get("Pos", "?")
-            options.append({"label": f"{row['Name']} ({pos} · {spts:.1f} SPTS)",
-                             "value": row["Name"], "_spts": float(spts)})
-    if not ctx.pit_full.empty and "Team" in ctx.pit_full.columns:
-        for _, row in ctx.pit_full[ctx.pit_full["Team"] == team].iterrows():
-            spts = pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0
-            role = row.get("Role", "P")
-            options.append({"label": f"{row['Name']} ({role} · {spts:.1f} SPTS)",
-                             "value": row["Name"], "_spts": float(spts)})
-    options.sort(key=lambda o: -o["_spts"])
-    return [{"label": o["label"], "value": o["value"]} for o in options]
+    opts = []
+    if team == _FA_TEAM:
+        if not ctx.fa_hit.empty:
+            for _, row in ctx.fa_hit.iterrows():
+                spts = float(pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0)
+                opts.append({"label": f"{row['Name']} ({row.get('Pos','?')} · {spts:.1f} SPTS)",
+                             "value": row["Name"], "_s": spts})
+        if not ctx.fa_pit.empty:
+            for _, row in ctx.fa_pit.iterrows():
+                spts = float(pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0)
+                opts.append({"label": f"{row['Name']} ({row.get('Role','P')} · {spts:.1f} SPTS)",
+                             "value": row["Name"], "_s": spts})
+    else:
+        if not ctx.hit_full.empty and "Team" in ctx.hit_full.columns:
+            for _, row in ctx.hit_full[ctx.hit_full["Team"] == team].iterrows():
+                spts = float(pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0)
+                opts.append({"label": f"{row['Name']} ({row.get('Pos','?')} · {spts:.1f} SPTS)",
+                             "value": row["Name"], "_s": spts})
+        if not ctx.pit_full.empty and "Team" in ctx.pit_full.columns:
+            for _, row in ctx.pit_full[ctx.pit_full["Team"] == team].iterrows():
+                spts = float(pd.to_numeric(row.get("SPTS", 0), errors="coerce") or 0)
+                opts.append({"label": f"{row['Name']} ({row.get('Role','P')} · {spts:.1f} SPTS)",
+                             "value": row["Name"], "_s": spts})
+    opts.sort(key=lambda o: -o["_s"])
+    return [{"label": o["label"], "value": o["value"]} for o in opts]
 
 
-def _evaluate_trade_logic(team_a, players_a, team_b, players_b, ctx):
-    """Swap players in-memory, re-run optimizers, return before/after dicts."""
+def _evaluate_trade_logic(team_a, players_a, drop_a,
+                          team_b, players_b, drop_b, ctx):
+    """
+    Swap players, apply FA additions and drops in-memory, re-run optimizers.
+    Either side can be _FA_TEAM (Free Agents).
+    """
+    fa_a = (team_a == _FA_TEAM)
+    fa_b = (team_b == _FA_TEAM)
+    if fa_a and fa_b:
+        return None
     if ctx.hit_full.empty or ctx.pit_full.empty:
         return None
 
     players_a = list(players_a or [])[:3]
     players_b = list(players_b or [])[:3]
+    drop_a    = list(drop_a or [])
+    drop_b    = list(drop_b or [])
 
-    hit_full = ctx.hit_full.copy()
-    pit_full = ctx.pit_full.copy()
+    hf = ctx.hit_full.copy()
+    pf = ctx.pit_full.copy()
 
-    # Reassign team labels
-    hit_full.loc[(hit_full["Name"].isin(players_a)) & (hit_full["Team"] == team_a), "Team"] = team_b
-    pit_full.loc[(pit_full["Name"].isin(players_a)) & (pit_full["Team"] == team_a), "Team"] = team_b
-    hit_full.loc[(hit_full["Name"].isin(players_b)) & (hit_full["Team"] == team_b), "Team"] = team_a
-    pit_full.loc[(pit_full["Name"].isin(players_b)) & (pit_full["Team"] == team_b), "Team"] = team_a
+    def _add_fa(names, target):
+        nonlocal hf, pf
+        if not names:
+            return
+        rh = ctx.fa_hit[ctx.fa_hit["Name"].isin(names)].copy() if not ctx.fa_hit.empty else pd.DataFrame()
+        rp = ctx.fa_pit[ctx.fa_pit["Name"].isin(names)].copy() if not ctx.fa_pit.empty else pd.DataFrame()
+        if not rh.empty:
+            rh["Team"] = target
+            hf = pd.concat([hf, rh], ignore_index=True)
+        if not rp.empty:
+            rp["Team"] = target
+            for col in ("Ros_IP", "Ros_SV", "Ros_HLD"):
+                if col not in rp.columns: rp[col] = 0.0
+            pf = pd.concat([pf, rp], ignore_index=True)
 
-    _HIT_COLS = ["Name", "Pos", "SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"]
-    _PIT_COLS = ["SV", "HLD", "IP", "GS", "SPTS", "SO", "BB", "HR", "FIP"]
+    # ── Apply trade / acquisition ─────────────────────────────────────────
+    if not fa_a and not fa_b:
+        # Normal trade: swap
+        hf.loc[(hf["Name"].isin(players_a)) & (hf["Team"] == team_a), "Team"] = team_b
+        pf.loc[(pf["Name"].isin(players_a)) & (pf["Team"] == team_a), "Team"] = team_b
+        hf.loc[(hf["Name"].isin(players_b)) & (hf["Team"] == team_b), "Team"] = team_a
+        pf.loc[(pf["Name"].isin(players_b)) & (pf["Team"] == team_b), "Team"] = team_a
+    elif fa_a:
+        # players_a = FA players going to team_b; players_b leave team_b
+        _add_fa(players_a, team_b)
+        hf = hf[~((hf["Name"].isin(players_b)) & (hf["Team"] == team_b))]
+        pf = pf[~((pf["Name"].isin(players_b)) & (pf["Team"] == team_b))]
+    else:  # fa_b
+        # players_b = FA players going to team_a; players_a leave team_a
+        _add_fa(players_b, team_a)
+        hf = hf[~((hf["Name"].isin(players_a)) & (hf["Team"] == team_a))]
+        pf = pf[~((pf["Name"].isin(players_a)) & (pf["Team"] == team_a))]
 
-    def _team_spts(team, hf, pf):
-        roster_h = hf[hf["Team"] == team][[c for c in _HIT_COLS if c in hf.columns]].copy()
+    # ── Apply drops ───────────────────────────────────────────────────────
+    if not fa_a and drop_a:
+        hf = hf[~((hf["Name"].isin(drop_a)) & (hf["Team"] == team_a))]
+        pf = pf[~((pf["Name"].isin(drop_a)) & (pf["Team"] == team_a))]
+    if not fa_b and drop_b:
+        hf = hf[~((hf["Name"].isin(drop_b)) & (hf["Team"] == team_b))]
+        pf = pf[~((pf["Name"].isin(drop_b)) & (pf["Team"] == team_b))]
+
+    _HIT_COLS  = ["Name", "Pos", "SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"]
+    _PIT_NUMS  = ["SV", "HLD", "IP", "GS", "SPTS", "SO", "BB", "HR", "FIP"]
+
+    def _team_spts(team, h, p):
+        roster_h = h[h["Team"] == team][[c for c in _HIT_COLS if c in h.columns]].copy()
         for col in ("SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"):
             if col in roster_h.columns:
                 roster_h[col] = pd.to_numeric(roster_h[col], errors="coerce").fillna(0)
-        roster_p = pf[pf["Team"] == team].copy()
-        for col in _PIT_COLS:
+        roster_p = p[p["Team"] == team].copy()
+        for col in _PIT_NUMS:
             roster_p[col] = pd.to_numeric(roster_p.get(col, 0), errors="coerce").fillna(0)
-        hit_spts, *_  = optimal_lineup_spts(roster_h)
+        hit_spts, *_       = optimal_lineup_spts(roster_h)
         sp_spts, rp_spts, *_ = constrained_pitcher_spts(roster_p)
         return {"Hit_SPTS": round(hit_spts, 1), "SP_SPTS": round(sp_spts, 1),
-                "RP_SPTS": round(rp_spts, 1),
+                "RP_SPTS":  round(rp_spts,  1),
                 "Total_SPTS": round(hit_spts + sp_spts + rp_spts, 1)}
 
     def _before(team):
@@ -1541,37 +1627,49 @@ def _evaluate_trade_logic(team_a, players_a, team_b, players_b, ctx):
         if row.empty:
             return {"Hit_SPTS": 0, "SP_SPTS": 0, "RP_SPTS": 0, "Total_SPTS": 0, "rank": None}
         r = row.iloc[0]
-        return {"Hit_SPTS": r.get("Hit_SPTS", 0), "SP_SPTS": r.get("SP_SPTS", 0),
-                "RP_SPTS": r.get("RP_SPTS", 0),   "Total_SPTS": r.get("Total_SPTS", 0),
+        return {"Hit_SPTS":   float(r.get("Hit_SPTS",   0)),
+                "SP_SPTS":    float(r.get("SP_SPTS",    0)),
+                "RP_SPTS":    float(r.get("RP_SPTS",    0)),
+                "Total_SPTS": float(r.get("Total_SPTS", 0)),
                 "rank": int(r["Rank"]) if "Rank" in ctx.summary.columns else None}
 
-    before_a, before_b = _before(team_a), _before(team_b)
-    after_a  = _team_spts(team_a, hit_full, pit_full)
-    after_b  = _team_spts(team_b, hit_full, pit_full)
+    # Only evaluate real (non-FA) teams, deduplicated
+    eval_teams = list(dict.fromkeys(t for t in [team_a, team_b] if t != _FA_TEAM))
+    before     = {t: _before(t)          for t in eval_teams}
+    after      = {t: _team_spts(t, hf, pf) for t in eval_teams}
 
-    # Re-rank the whole league with the swapped totals
+    # Re-rank the whole league
     totals = {}
     for t in ctx.teams:
         row = ctx.summary[ctx.summary["Team"] == t]
         totals[t] = float(row["Total_SPTS"].iloc[0]) if not row.empty else 0.0
-    totals[team_a] = after_a["Total_SPTS"]
-    totals[team_b] = after_b["Total_SPTS"]
-    sorted_teams = sorted(totals, key=lambda t: totals[t], reverse=True)
-    new_rank     = {t: i + 1 for i, t in enumerate(sorted_teams)}
-    after_a["rank"] = new_rank.get(team_a)
-    after_b["rank"] = new_rank.get(team_b)
+    for t in eval_teams:
+        totals[t] = after[t]["Total_SPTS"]
+    new_rank = {t: i + 1 for i, t in enumerate(
+        sorted(totals, key=lambda x: totals[x], reverse=True))}
+    for t in eval_teams:
+        after[t]["rank"] = new_rank.get(t)
 
-    return {"before_a": before_a, "after_a": after_a,
-            "before_b": before_b, "after_b": after_b,
-            "players_a": players_a, "players_b": players_b}
+    # Build per-team in/out/drop summaries
+    gave, got, dropped = {}, {}, {}
+    if not fa_a and not fa_b:
+        gave[team_a] = players_a; got[team_a] = players_b; dropped[team_a] = drop_a
+        gave[team_b] = players_b; got[team_b] = players_a; dropped[team_b] = drop_b
+    elif fa_a:
+        gave[team_b] = players_b; got[team_b] = players_a; dropped[team_b] = drop_b
+    else:
+        gave[team_a] = players_a; got[team_a] = players_b; dropped[team_a] = drop_a
+
+    return {"eval_teams": eval_teams,
+            "before": before, "after": after,
+            "gave": gave, "got": got, "dropped": dropped}
 
 
-def _trade_result_card(team_name, before, after, give_players, get_players, accent):
+def _trade_result_card(team_name, before, after, give_players, get_players,
+                       drop_players, accent):
     """Styled before/after comparison card for one side of a trade."""
-    stat_rows = [("Total SPTS", "Total_SPTS"),
-                 ("Hitting",    "Hit_SPTS"),
-                 ("Starting P", "SP_SPTS"),
-                 ("Relief P",   "RP_SPTS")]
+    stat_rows = [("Total SPTS", "Total_SPTS"), ("Hitting",    "Hit_SPTS"),
+                 ("Starting P", "SP_SPTS"),    ("Relief P",   "RP_SPTS")]
 
     def _stat_row(label, key):
         b_val  = float(before.get(key, 0))
@@ -1586,7 +1684,7 @@ def _trade_result_card(team_name, before, after, give_players, get_players, acce
             html.Span(f"{b_val:,.1f}", style={"color": C_TEXT, "fontSize": "13px",
                                                "minWidth": "70px", "textAlign": "right",
                                                "fontWeight": bold}),
-            html.Span("→",             style={"color": C_MUTED, "margin": "0 8px"}),
+            html.Span("→",        style={"color": C_MUTED, "margin": "0 8px"}),
             html.Span(f"{a_val:,.1f}", style={"color": C_TEXT, "fontSize": "13px",
                                                "minWidth": "70px", "textAlign": "right",
                                                "fontWeight": bold}),
@@ -1597,38 +1695,54 @@ def _trade_result_card(team_name, before, after, give_players, get_players, acce
 
     b_rank = before.get("rank")
     a_rank = after.get("rank")
-    rd = (b_rank - a_rank) if isinstance(b_rank, int) and isinstance(a_rank, int) else None
+    rd     = (b_rank - a_rank) if isinstance(b_rank, int) and isinstance(a_rank, int) else None
     rank_col = "#22C55E" if rd and rd > 0 else ("#EF4444" if rd and rd < 0 else C_MUTED)
     rank_d   = (f"+{rd}" if rd > 0 else str(rd)) if rd else "—"
 
+    summary_items = []
+    if give_players:
+        summary_items.append(html.Div([
+            html.Span("OUT: ", style={"color": "#EF4444", "fontWeight": "700", "fontSize": "12px"}),
+            html.Span(", ".join(give_players), style={"color": C_TEXT, "fontSize": "12px"}),
+        ], style={"marginBottom": "3px"}))
+    if get_players:
+        summary_items.append(html.Div([
+            html.Span("IN:   ", style={"color": "#22C55E", "fontWeight": "700", "fontSize": "12px"}),
+            html.Span(", ".join(get_players), style={"color": C_TEXT, "fontSize": "12px"}),
+        ], style={"marginBottom": "3px"}))
+    if drop_players:
+        summary_items.append(html.Div([
+            html.Span("DROP: ", style={"color": "#F59E0B", "fontWeight": "700", "fontSize": "12px"}),
+            html.Span(", ".join(drop_players), style={"color": C_TEXT, "fontSize": "12px"}),
+        ]))
+    if not summary_items:
+        summary_items = [html.Span("— no changes —",
+                                   style={"color": C_MUTED, "fontSize": "12px"})]
+
     return html.Div([
+        html.H3(team_name, style={"margin": "0 0 4px", "fontSize": "16px",
+                                   "fontWeight": "700", "color": accent}),
         html.Div([
-            html.H3(team_name, style={"margin": "0 0 4px", "fontSize": "16px",
-                                       "fontWeight": "700", "color": accent}),
-            html.Div([
-                html.Span(f"Rank {b_rank or '?'}", style={"color": C_MUTED, "fontSize": "12px"}),
-                html.Span("→", style={"color": C_MUTED, "margin": "0 6px", "fontSize": "12px"}),
-                html.Span(f"Rank {a_rank or '?'}", style={"color": C_TEXT,  "fontSize": "12px"}),
-                html.Span(rank_d, style={"color": rank_col, "fontWeight": "700",
-                                          "marginLeft": "6px", "fontSize": "12px"}),
-            ], style={"display": "flex", "alignItems": "center", "marginBottom": "14px"}),
-        ]),
-        html.Div([
-            html.Div([html.Span("OUT: ", style={"color": "#EF4444", "fontWeight": "700", "fontSize": "12px"}),
-                      html.Span(", ".join(give_players) if give_players else "—",
-                                style={"color": C_TEXT, "fontSize": "12px"})],
-                     style={"marginBottom": "3px"}),
-            html.Div([html.Span("IN:  ", style={"color": "#22C55E", "fontWeight": "700", "fontSize": "12px"}),
-                      html.Span(", ".join(get_players) if get_players else "—",
-                                style={"color": C_TEXT, "fontSize": "12px"})]),
-        ], style={"marginBottom": "14px", "padding": "10px", "background": C_BG,
-                  "borderRadius": "6px"}),
+            html.Span(f"Rank {b_rank or '?'}",
+                      style={"color": C_MUTED, "fontSize": "12px"}),
+            html.Span("→", style={"color": C_MUTED, "margin": "0 6px", "fontSize": "12px"}),
+            html.Span(f"Rank {a_rank or '?'}",
+                      style={"color": C_TEXT,  "fontSize": "12px"}),
+            html.Span(rank_d, style={"color": rank_col, "fontWeight": "700",
+                                      "marginLeft": "6px", "fontSize": "12px"}),
+        ], style={"display": "flex", "alignItems": "center", "marginBottom": "14px"}),
+        html.Div(summary_items, style={"marginBottom": "14px", "padding": "10px",
+                                       "background": C_BG, "borderRadius": "6px"}),
         html.Div([
             html.Span("",       style={"minWidth": "82px", "flexShrink": "0"}),
-            html.Span("Before", style={"color": C_MUTED, "fontSize": "11px", "minWidth": "70px", "textAlign": "right"}),
+            html.Span("Before", style={"color": C_MUTED, "fontSize": "11px",
+                                        "minWidth": "70px", "textAlign": "right"}),
             html.Span("",       style={"margin": "0 8px", "opacity": "0"}),
-            html.Span("After",  style={"color": C_MUTED, "fontSize": "11px", "minWidth": "70px", "textAlign": "right"}),
-            html.Span("Δ",      style={"color": C_MUTED, "fontSize": "11px", "minWidth": "52px", "textAlign": "right", "flexShrink": "0"}),
+            html.Span("After",  style={"color": C_MUTED, "fontSize": "11px",
+                                        "minWidth": "70px", "textAlign": "right"}),
+            html.Span("Δ", style={"color": C_MUTED, "fontSize": "11px",
+                                        "minWidth": "52px", "textAlign": "right",
+                                        "flexShrink": "0"}),
         ], style={"display": "flex", "alignItems": "center", "marginBottom": "6px"}),
         *[_stat_row(label, key) for label, key in stat_rows],
     ], style={
@@ -1639,66 +1753,116 @@ def _trade_result_card(team_name, before, after, give_players, get_players, acce
 
 # ── Trade Machine callbacks ───────────────────────────────────────────────────
 
+_FA_LABEL_SEND  = "Players to trade away (up to 3)"
+_FA_LABEL_RECV  = "FA players to add to the other team (up to 3)"
+_FA_HIDE = {"display": "none"}
+_FA_SHOW = {}
+
+
 @app.callback(
     Output("trade-players-a", "options"),
     Output("trade-players-a", "value"),
+    Output("trade-label-a",   "children"),
+    Output("trade-drop-a",    "options"),
+    Output("trade-drop-a",    "value"),
+    Output("trade-drop-wrap-a", "style"),
     Input("trade-team-a", "value"),
     Input("proj-system-radio", "value"),
 )
-def populate_trade_players_a(team_a, sys_val):
-    ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
-    return _trade_player_options(team_a, ctx), []
+def populate_trade_a(team_a, sys_val):
+    ctx  = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+    opts = _trade_player_options(team_a, ctx)
+    is_fa = (team_a == _FA_TEAM)
+    label = _FA_LABEL_RECV if is_fa else _FA_LABEL_SEND
+    drop_style = _FA_HIDE if is_fa else _FA_SHOW
+    return opts, [], label, (opts if not is_fa else []), [], drop_style
 
 
 @app.callback(
     Output("trade-players-b", "options"),
     Output("trade-players-b", "value"),
+    Output("trade-label-b",   "children"),
+    Output("trade-drop-b",    "options"),
+    Output("trade-drop-b",    "value"),
+    Output("trade-drop-wrap-b", "style"),
     Input("trade-team-b", "value"),
     Input("proj-system-radio", "value"),
 )
-def populate_trade_players_b(team_b, sys_val):
-    ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
-    return _trade_player_options(team_b, ctx), []
+def populate_trade_b(team_b, sys_val):
+    ctx  = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
+    opts = _trade_player_options(team_b, ctx)
+    is_fa = (team_b == _FA_TEAM)
+    label = _FA_LABEL_RECV if is_fa else _FA_LABEL_SEND
+    drop_style = _FA_HIDE if is_fa else _FA_SHOW
+    return opts, [], label, (opts if not is_fa else []), [], drop_style
+
+
+@app.callback(
+    Output("trade-players-a", "value", allow_duplicate=True),
+    Output("trade-drop-a",    "value", allow_duplicate=True),
+    Output("trade-players-b", "value", allow_duplicate=True),
+    Output("trade-drop-b",    "value", allow_duplicate=True),
+    Output("trade-result",    "children", allow_duplicate=True),
+    Input("trade-reset-btn",  "n_clicks"),
+    prevent_initial_call=True,
+)
+def reset_trade(_):
+    return [], [], [], [], html.Div()
 
 
 @app.callback(
     Output("trade-result", "children"),
     Input("trade-evaluate-btn", "n_clicks"),
-    State("trade-team-a", "value"),
+    State("trade-team-a",    "value"),
     State("trade-players-a", "value"),
-    State("trade-team-b", "value"),
+    State("trade-drop-a",    "value"),
+    State("trade-team-b",    "value"),
     State("trade-players-b", "value"),
+    State("trade-drop-b",    "value"),
     State("proj-system-radio", "value"),
     prevent_initial_call=True,
 )
-def evaluate_trade(n_clicks, team_a, players_a, team_b, players_b, sys_val):
+def evaluate_trade(n_clicks, team_a, players_a, drop_a,
+                   team_b, players_b, drop_b, sys_val):
     if not team_a or not team_b:
         return html.P("Please select both teams.", style={"color": C_MUTED})
+    if team_a == _FA_TEAM and team_b == _FA_TEAM:
+        return html.P("At least one side must be a real team.", style={"color": C_MUTED})
 
     ctx = _ALL_CTX.get(sys_val, _DEFAULT_CTX)
 
     if ctx.hit_full.empty or ctx.pit_full.empty:
         return html.P(
             "Trade machine needs updated data — re-run ottoneu_power_rankings.py "
-            "to regenerate the workbook with roster sheets, then redeploy.",
+            "to regenerate the workbook, then redeploy.",
             style={"color": "#EF4444", "fontSize": "13px"},
         )
 
     result = _evaluate_trade_logic(
-        team_a, list(players_a or [])[:3],
-        team_b, list(players_b or [])[:3], ctx)
+        team_a, list(players_a or [])[:3], list(drop_a or []),
+        team_b, list(players_b or [])[:3], list(drop_b or []), ctx)
+
     if result is None:
         return html.P("Could not evaluate trade.", style={"color": C_MUTED})
 
-    card_a = _trade_result_card(team_a, result["before_a"], result["after_a"],
-                                result["players_a"], result["players_b"], C_HIT)
-    card_b = _trade_result_card(team_b, result["before_b"], result["after_b"],
-                                result["players_b"], result["players_a"], C_RP)
+    cards = []
+    accents = {team_a: C_HIT, team_b: C_RP}
+    if len(result["eval_teams"]) == 1:
+        accents[result["eval_teams"][0]] = C_SP
+
+    for team in result["eval_teams"]:
+        cards.append(_trade_result_card(
+            team,
+            result["before"][team], result["after"][team],
+            result["gave"].get(team, []),
+            result["got"].get(team, []),
+            result["dropped"].get(team, []),
+            accents.get(team, C_SP),
+        ))
 
     return html.Div([
-        html.Div([card_a, card_b],
-                 style={"display": "flex", "gap": "16px", "alignItems": "stretch"}),
-        html.P("Rankings re-computed across the full league with the swapped rosters.",
+        html.Div(cards, style={"display": "flex", "gap": "16px", "alignItems": "stretch"}),
+        html.P("Rankings re-computed across the full league with the modified rosters.",
                style={"color": C_MUTED, "fontSize": "11px",
                       "marginTop": "12px", "textAlign": "center"}),
     ])

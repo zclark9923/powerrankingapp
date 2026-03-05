@@ -424,6 +424,34 @@ def run_projection_system(sys_name: str, hit_proj_file: str,
     hit_df   = hit_df[hit_df["Pos"] != "P"].copy()
     hit_full = hit_full[hit_full["Pos"] != "P"].copy()
 
+    # ── Free-agent frames (projected but not rostered) ────────────────────────
+    _rostered_hit_pids = set(hit_roster_ids["PlayerId"].astype(str))
+    _rostered_pit_pids = set(pit_roster_ids["PlayerId"].astype(str))
+    fa_hit_raw = hit_proj[~hit_proj["PlayerId"].astype(str).isin(_rostered_hit_pids)].copy()
+    fa_pit_raw = pit_proj[~pit_proj["PlayerId"].astype(str).isin(_rostered_pit_pids)].copy()
+    for col in ("SPTS", "SPTS/G", "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"):
+        fa_hit_raw[col] = pd.to_numeric(fa_hit_raw.get(col, 0), errors="coerce").fillna(0)
+    for col in ("SPTS", "IP", "SV", "HLD", "GS", "SO", "BB", "HR", "FIP"):
+        fa_pit_raw[col] = pd.to_numeric(fa_pit_raw.get(col, 0), errors="coerce").fillna(0)
+    for col in _HIT_SCALE:
+        if col in fa_hit_raw.columns: fa_hit_raw[col] = fa_hit_raw[col] * SCHEDULE_SCALE
+    for col in _PIT_SCALE:
+        if col in fa_pit_raw.columns: fa_pit_raw[col] = fa_pit_raw[col] * SCHEDULE_SCALE
+    # Assign positions using fielding file (PlayerId-keyed); default OF for unknowns
+    fa_hit_raw["Pos"] = fa_hit_raw["PlayerId"].astype(str).apply(
+        lambda pid: pos_by_playerid.get(pid, "OF"))
+    fa_hit_raw = fa_hit_raw[fa_hit_raw["Pos"] != "P"].copy()
+    _fa_rp = (fa_pit_raw["SV"] > 2) | (fa_pit_raw["HLD"] > 5) | (fa_pit_raw["IP"] < 70)
+    fa_pit_raw["Role"] = _fa_rp.map({True: "RP", False: "SP"})
+    _FA_HIT_KEEP = [c for c in ["Name", "PlayerId", "Pos", "SPTS", "SPTS/G",
+                                 "AB", "H", "2B", "BB", "HR", "SB", "wOBA", "OPS"]
+                    if c in fa_hit_raw.columns]
+    _FA_PIT_KEEP = [c for c in ["Name", "PlayerId", "Role", "SPTS", "IP", "GS",
+                                 "SV", "HLD", "SO", "BB", "HR", "FIP"]
+                    if c in fa_pit_raw.columns]
+    fa_hit = fa_hit_raw[_FA_HIT_KEEP].sort_values("SPTS", ascending=False).reset_index(drop=True)
+    fa_pit = fa_pit_raw[_FA_PIT_KEEP].sort_values("SPTS",  ascending=False).reset_index(drop=True)
+
     for _pf in (pit_df, pit_full):
         _pf["MLBAMID"] = pd.to_numeric(_pf["MLBAMID"], errors="coerce")
         _pf["Age"] = _pf["MLBAMID"].apply(
@@ -590,8 +618,10 @@ def run_projection_system(sys_name: str, hit_proj_file: str,
         "sp":        sp_df_out,
         "rp":        rp_df_out,
         "roster":    roster_df,
-        "hit_full":  hit_full,   # all rostered hitters with projections + positions
-        "pit_full":  pit_full,   # all rostered pitchers with projections + role
+        "hit_full":  hit_full,
+        "pit_full":  pit_full,
+        "fa_hit":    fa_hit,
+        "fa_pit":    fa_pit,
         "lineups":   team_lineups,
         "pitching":  team_pitching,
     }
@@ -649,6 +679,12 @@ def main():
             if not _data["pit_full"].empty:
                 _data["pit_full"].to_excel(
                     writer, sheet_name=f"{_pfx}_Pit_Roster", index=False)
+            if not _data["fa_hit"].empty:
+                _data["fa_hit"].to_excel(
+                    writer, sheet_name=f"{_pfx}_FA_Hit", index=False)
+            if not _data["fa_pit"].empty:
+                _data["fa_pit"].to_excel(
+                    writer, sheet_name=f"{_pfx}_FA_Pit", index=False)
 
 
 if __name__ == "__main__":

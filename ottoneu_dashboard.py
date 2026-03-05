@@ -1396,6 +1396,22 @@ app.layout = html.Div(className="page-wrap", style={
                 ], style={"flex": "none", "minWidth": "180px"}),
 
                 html.Div([
+                    html.Label("Max salary diff ($)",
+                               style={"color": C_MUTED, "fontSize": "12px",
+                                      "marginBottom": "4px", "display": "block"}),
+                    dcc.Input(
+                        id="opt-salary-tol",
+                        type="number", value=3, min=0, max=50, step=1,
+                        style={
+                            "width": "80px", "background": "#1E293B",
+                            "color": C_TEXT, "border": f"1px solid {C_GRID}",
+                            "borderRadius": "6px", "padding": "8px 10px",
+                            "fontSize": "13px",
+                        },
+                    ),
+                ], style={"flex": "none"}),
+
+                html.Div([
                     html.Label("\u00a0", style={"display": "block", "marginBottom": "4px"}),
                     html.Button(
                         "Find Optimal Trades",
@@ -2124,7 +2140,7 @@ def evaluate_trade(n_clicks, team_a, players_a, drop_a,
 # Shared computation + table-building logic used by both callback variants.
 
 def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
-                        set_progress=None):
+                        set_progress=None, salary_tol=3):
     """Run the optimizer and return (children, store_data)."""
     def _prog(msg):
         if set_progress:
@@ -2149,6 +2165,7 @@ def _run_optimizer_core(team_a, team_b, max_players, sys_val, patch_data,
             max_players=max_players,
             top_n=10,
             time_budget=per_opp_budget,
+            salary_tol=salary_tol,
         )
         for r in results:
             r["_opp"] = opp
@@ -2270,6 +2287,7 @@ if background_callback_manager is not None:
             State("opt-team-a",        "value"),
             State("opt-team-b",        "value"),
             State("opt-max-players",   "value"),
+            State("opt-salary-tol",    "value"),
             State("proj-system-radio", "value"),
             State("trade-patch-store", "data"),
         ],
@@ -2286,12 +2304,13 @@ if background_callback_manager is not None:
         prevent_initial_call=True,
     )
     def run_trade_optimizer_bg(set_progress, n_clicks, team_a, team_b,
-                               max_players, sys_val, patch_data):
+                               max_players, salary_tol, sys_val, patch_data):
         if not n_clicks:
             return html.Div(), []
         try:
             return _run_optimizer_core(team_a, team_b, max_players,
-                                       sys_val, patch_data, set_progress)
+                                       sys_val, patch_data, set_progress,
+                                       salary_tol=salary_tol or 3)
         except Exception as exc:
             return _opt_error_output(exc)
 
@@ -2304,17 +2323,19 @@ else:
         State("opt-team-a",        "value"),
         State("opt-team-b",        "value"),
         State("opt-max-players",   "value"),
+        State("opt-salary-tol",    "value"),
         State("proj-system-radio", "value"),
         State("trade-patch-store", "data"),
         prevent_initial_call=True,
     )
     def run_trade_optimizer_sync(n_clicks, team_a, team_b, max_players,
-                                 sys_val, patch_data):
+                                 salary_tol, sys_val, patch_data):
         if not n_clicks:
             return html.Div(), []
         try:
             return _run_optimizer_core(team_a, team_b, max_players,
-                                       sys_val, patch_data)
+                                       sys_val, patch_data,
+                                       salary_tol=salary_tol or 3)
         except Exception as exc:
             return _opt_error_output(exc)
 

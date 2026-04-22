@@ -1787,13 +1787,6 @@ def _team_logo_url(team_abbr: str) -> str:
     return f"https://a.espncdn.com/i/teamlogos/mlb/500/{team_abbr.lower()}.png"
 
 
-def _player_headshot_url(player_id: int) -> str:
-    return (
-        "https://img.mlbstatic.com/mlb-photos/image/upload/"
-        f"w_213,q_auto:best/v1/people/{player_id}/headshot/67/current"
-    )
-
-
 def _discord_embed(
     title: str,
     description: str,
@@ -1815,11 +1808,9 @@ def _discord_embed(
         },
         "footer": {
             "text": status,
-            "icon_url": home_logo,
         },
+        "thumbnail": {"url": home_logo},
     }
-    if player_id is not None:
-        embed["thumbnail"] = {"url": _player_headshot_url(player_id)}
     return embed
 
 
@@ -2004,6 +1995,49 @@ def _fetch_highlights(game_pk: int) -> list[dict]:
                 "fielding alignment",
                 "condensed game",
                 "recap",
+            )
+        ):
+            continue
+        if any(
+            marker in lower_headline
+            for marker in (
+                "diving play",
+                "spectacular play",
+                "great play",
+                "defensive play",
+                "sliding stop",
+                "leaping catch",
+                "great catch",
+                "running catch",
+                "barehanded",
+                "web gem",
+                "robs",
+                "robbery",
+                "snags",
+                "throws out",
+                "double play",
+            )
+        ):
+            continue
+        if not any(
+            marker in lower_headline
+            for marker in (
+                "single",
+                "double",
+                "triple",
+                "home run",
+                "homer",
+                "grand slam",
+                "walk-off",
+                "walks",
+                "hit by pitch",
+                "rbi",
+                "drives in",
+                "plates",
+                "scores",
+                "stolen base",
+                "steals",
+                "collects",
             )
         ):
             continue
@@ -2319,7 +2353,10 @@ def process_game(
         if clip_id in seen_clips or clip_key in seen_clips:
             continue
 
-        watched_ids = [pid for pid in clip["player_ids"] if pid in watchlist]
+        watched_ids = [
+            pid for pid in clip["player_ids"]
+            if pid in watchlist and watchlist[pid].role in {"hitter", "both"}
+        ]
         if not watched_ids:
             continue
 

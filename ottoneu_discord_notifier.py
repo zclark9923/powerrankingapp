@@ -933,13 +933,18 @@ def load_watchlist_from_discord_html_attachments(
     role: str,
     limit: int = 10,
 ) -> dict[int, WatchPlayer]:
-    html_files = fetch_discord_html_attachments(
-        channel_id=channel_id,
-        bot_token=bot_token,
-        limit=limit,
-    )
+    # Support comma-separated list of channel IDs so multiple rosters can be merged
+    channel_ids = [cid.strip() for cid in channel_id.split(",") if cid.strip()]
+    html_files: list[tuple[str, str]] = []
+    for cid in channel_ids:
+        files = fetch_discord_html_attachments(
+            channel_id=cid,
+            bot_token=bot_token,
+            limit=limit,
+        )
+        html_files.extend(files)
     if not html_files:
-        print("No Discord HTML attachments found in the configured channel")
+        print("No Discord HTML attachments found in the configured channel(s)")
         return {}
 
     out: dict[int, WatchPlayer] = {}
@@ -2450,7 +2455,7 @@ def parse_args() -> argparse.Namespace:
         "--discord-html-channel-id",
         type=str,
         default=os.getenv("DISCORD_HTML_CHANNEL_ID", ""),
-        help="Discord channel ID to read uploaded Ottoneu HTML attachments from",
+        help="Discord channel ID(s) to read uploaded Ottoneu HTML attachments from (comma-separated for multiple channels)",
     )
     parser.add_argument(
         "--discord-bot-token",

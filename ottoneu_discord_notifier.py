@@ -73,6 +73,9 @@ NOTABLE_BATTER_EVENTS = {
 }
 
 NOTABLE_PITCHER_EVENTS = {
+    "strikeout",
+    "walk",
+    "hit_by_pitch",
     "home_run",
 }
 
@@ -1269,6 +1272,19 @@ def _statcast_suffix(play: dict[str, Any]) -> str:
     return f" ({', '.join(parts)})"
 
 
+def _innings_pitched_to_outs(ip_value: str) -> int:
+    """Convert innings pitched string (e.g., 1.2) to recorded outs (e.g., 5)."""
+    try:
+        whole_str, frac_str = str(ip_value).split(".", 1)
+        whole = int(whole_str)
+        frac = int(frac_str)
+    except (ValueError, TypeError):
+        return 0
+    if frac not in {0, 1, 2}:
+        return 0
+    return whole * 3 + frac
+
+
 def process_game(
     game_pk: int,
     watchlist: dict[int, WatchPlayer],
@@ -1318,7 +1334,14 @@ def process_game(
             )
             announced_lineups.add(lineup_key)
 
-    plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
+    plays_data = feed.get("liveData", {}).get("plays", {})
+    plays = plays_data.get("allPlays", [])
+    current_pitcher_id = None
+    current_play = plays_data.get("currentPlay", {})
+    if isinstance(current_play, dict):
+        maybe_pitcher = current_play.get("matchup", {}).get("pitcher", {}).get("id")
+        if isinstance(maybe_pitcher, int):
+            current_pitcher_id = maybe_pitcher
     for play in plays:
         result = play.get("result", {})
         about = play.get("about", {})
@@ -1404,8 +1427,81 @@ def process_game(
                     )
                     sent_keys.add(key)
 
-    # Pitcher 3-inning milestone alerts (fires at 3, 6, 9 IP)
+    # Pitcher outing-complete alerts (helps surface reliever appearances).
     bs_teams = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    is_final = status.lower() == "final"
+    for side in ("home", "away"):
+        for key, pobj in bs_teams.get(side, {}).get("players", {}).items():
+            if not key.startswith("ID"):
+                continue
+            try:
+                pid = int(key[2:])
+            except ValueError:
+                continue
+            if pid not in watchlist:
+                continue
+            wp = watchlist[pid]
+            if wp.role not in {"pitcher", "both"}:
+                continue
+
+            pitching = pobj.get("stats", {}).get("pitching", {})
+            if not pitching:
+                continue
+            outs_recorded = _innings_pitched_to_outs(str(pitching.get("inningsPitched", "0.0")))
+            if outs_recorded <= 0:
+                continue
+
+            outing_key = f"{game_pk}:pitcher_outing:{pid}"
+            if outing_key in sent_keys:
+                continue
+            if not is_final and current_pitcher_id == pid:
+                continue
+
+            so = int(pitching.get("strikeOuts", 0) or 0)
+            bb = int(pitching.get("baseOnBalls", 0) or 0)
+            hbp = int(pitching.get("hitBatsmen", 0) or 0)
+            hr = int(pitching.get("homeRuns", 0) or 0)
+            sv = int(pitching.get("saves", 0) or 0)
+            holds = int(pitching.get("holds", 0) or 0)
+            er = int(pitching.get("earnedRuns", 0) or 0)
+            whip = pitching.get("whip", "-")
+            ip = str(pitching.get("inningsPitched", "0.0"))
+
+            outing_points = (
+                (outs_recorded / 3.0) * SABR_PITCHING_POINTS["ip"]
+                + so * SABR_PITCHING_POINTS["strikeout"]
+                + bb * SABR_PITCHING_POINTS["walk"]
+                + hbp * SABR_PITCHING_POINTS["hbp"]
+                + hr * SABR_PITCHING_POINTS["home_run"]
+                + sv * SABR_PITCHING_POINTS["save"]
+                + holds * SABR_PITCHING_POINTS["hold"]
+            )
+            sign = "+" if outing_points >= 0 else ""
+            api_obj = player_map.get(pid, {})
+            name = _display_name(api_obj, wp.name)
+            summary = (
+                f"{name} finished: {ip} IP, {so} K, {bb} BB, {er} ER, WHIP {whip}"
+                f" | **{sign}{outing_points:.1f} pts**"
+            )
+            send_webhook(
+                webhook_url,
+                f"{EVENT_EMOJIS['final']} {game_text}: {summary}",
+                dry_run=dry_run,
+                embeds=[
+                    _discord_embed(
+                        title=f"{name} Outing Complete",
+                        description=summary,
+                        away_abbr=away_abbr,
+                        home_abbr=home_abbr,
+                        status=status,
+                        color=0x8E44AD,
+                        player_id=pid,
+                    )
+                ],
+            )
+            sent_keys.add(outing_key)
+
+    # Pitcher 3-inning milestone alerts (fires at 3, 6, 9 IP)
     for side in ("home", "away"):
         for key, pobj in bs_teams.get(side, {}).get("players", {}).items():
             if not key.startswith("ID"):
@@ -1472,7 +1568,6 @@ def process_game(
         )
         seen_clips.add(clip_id)
 
-    is_final = status.lower() == "final"
     if is_final:
         final_key = f"{game_pk}:final"
         if final_key not in final_summaries:

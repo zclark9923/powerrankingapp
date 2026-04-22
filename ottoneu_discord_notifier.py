@@ -1256,6 +1256,17 @@ def _find_player_boxscore_entry(
     return None
 
 
+def _player_team_abbr(feed: dict[str, Any], player_id: int) -> str | None:
+    gd_teams = feed.get("gameData", {}).get("teams", {})
+    bs_teams = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    key = f"ID{player_id}"
+    for side in ("home", "away"):
+        players = bs_teams.get(side, {}).get("players", {})
+        if key in players:
+            return gd_teams.get(side, {}).get("abbreviation")
+    return None
+
+
 def _player_play_lines(
     feed: dict[str, Any],
     player_id: int,
@@ -1826,20 +1837,20 @@ def _discord_embed(
     status: str,
     color: int,
     player_id: int | None = None,
+    player_team_abbr: str | None = None,
 ) -> dict[str, Any]:
     away_logo = _team_logo_url(away_abbr)
-    home_logo = _team_logo_url(home_abbr)
+    header_logo = _team_logo_url(player_team_abbr) if player_team_abbr else away_logo
     embed: dict[str, Any] = {
         "title": title,
         "description": description,
         "color": color,
         "author": {
             "name": f"{away_abbr} @ {home_abbr}",
-            "icon_url": away_logo,
+            "icon_url": header_logo,
         },
         "footer": {
             "text": status,
-            "icon_url": home_logo,
         },
     }
     if player_id is not None:
@@ -2277,6 +2288,7 @@ def process_game(
                                 status=status,
                                 color=0x1ABC9C,
                                 player_id=batter_id,
+                                player_team_abbr=_player_team_abbr(feed, batter_id),
                             )
                         ],
                     )
@@ -2317,6 +2329,7 @@ def process_game(
                                 status=status,
                                 color=0xE67E22,
                                 player_id=pitcher_id,
+                                player_team_abbr=_player_team_abbr(feed, pitcher_id),
                             )
                         ],
                     )
@@ -2382,6 +2395,7 @@ def process_game(
                         status=status,
                         color=0x8E44AD,
                         player_id=pid,
+                        player_team_abbr=_player_team_abbr(feed, pid),
                     )
                 ],
             )
@@ -2435,6 +2449,7 @@ def process_game(
                             status=status,
                             color=0x95A5A6,
                             player_id=pid,
+                            player_team_abbr=_player_team_abbr(feed, pid),
                         )
                     ],
                 )

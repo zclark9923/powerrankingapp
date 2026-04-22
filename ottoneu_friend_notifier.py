@@ -875,6 +875,10 @@ def _extract_html_from_webarchive(webarchive_data: bytes) -> str | None:
     return None
 
 
+def _split_discord_channel_ids(channel_id: str) -> list[str]:
+    return [cid.strip() for cid in channel_id.split(",") if cid.strip()]
+
+
 def fetch_discord_html_attachments(
     channel_id: str,
     bot_token: str,
@@ -934,7 +938,7 @@ def load_watchlist_from_discord_html_attachments(
     limit: int = 10,
 ) -> dict[int, WatchPlayer]:
     # Support comma-separated list of channel IDs so multiple rosters can be merged
-    channel_ids = [cid.strip() for cid in channel_id.split(",") if cid.strip()]
+    channel_ids = _split_discord_channel_ids(channel_id)
     html_files: list[tuple[str, str]] = []
     for cid in channel_ids:
         files = fetch_discord_html_attachments(
@@ -1513,10 +1517,12 @@ def process_discord_text_commands(
                 f"{prefix} clearnicknames - remove all nicknames"
             )
         elif command == "status":
+            html_channel_count = len(_split_discord_channel_ids(args.discord_html_channel_id))
             response = (
                 f"Watching {len(watchlist)} players across {len(team_ids)} teams for {target_date.isoformat()}.\n"
                 f"Intervals: live {args.poll_seconds}s, pregame {args.pregame_seconds}s, idle {args.idle_seconds}s.\n"
-                f"Watchlist refresh {args.watchlist_refresh_seconds}s, post-final poll {args.postfinal_poll_seconds}s."
+                f"Watchlist refresh {args.watchlist_refresh_seconds}s, post-final poll {args.postfinal_poll_seconds}s.\n"
+                f"Discord HTML channels configured: {html_channel_count}."
             )
         elif command == "watchlist":
             response = f"Watchlist ({len(watchlist)}): {_watchlist_preview(watchlist)}"
@@ -1540,6 +1546,7 @@ def process_discord_text_commands(
                 except Exception as exc:  # noqa: BLE001
                     response = f"Refresh failed: {exc}"
                 else:
+                    html_channel_count = len(_split_discord_channel_ids(args.discord_html_channel_id))
                     if changed:
                         discord_watchlist = refreshed_discord_watchlist
                         watchlist = dict(base_watchlist)
@@ -1547,12 +1554,12 @@ def process_discord_text_commands(
                         team_ids = watched_team_ids(watchlist)
                         state["announced_lineups"] = []
                         response = (
-                            f"Loaded {len(discord_watchlist)} Discord players. "
+                            f"Loaded {len(discord_watchlist)} Discord players from {html_channel_count} HTML channel(s). "
                             f"Now tracking {len(watchlist)} total players."
                         )
                     else:
                         response = (
-                            f"No HTML uploads found in channel. Tracking {len(discord_watchlist)} Discord players "
+                            f"No HTML uploads found across {html_channel_count} HTML channel(s). Tracking {len(discord_watchlist)} Discord players "
                             f"and {len(watchlist)} total players."
                         )
         elif command.startswith("player "):

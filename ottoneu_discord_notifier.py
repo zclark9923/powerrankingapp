@@ -1256,7 +1256,13 @@ def _find_player_boxscore_entry(
     return None
 
 
-def _player_play_lines(feed: dict[str, Any], player_id: int) -> tuple[list[str], list[str], float, float]:
+def _player_play_lines(
+    feed: dict[str, Any],
+    player_id: int,
+    *,
+    include_all_batter_events: bool = False,
+    include_statcast: bool = False,
+) -> tuple[list[str], list[str], float, float]:
     plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
     batter_lines: list[str] = []
     pitcher_lines: list[str] = []
@@ -1280,8 +1286,11 @@ def _player_play_lines(feed: dict[str, Any], player_id: int) -> tuple[list[str],
         if batter_id == player_id:
             pts = _event_sabr_points(event_type, is_batter=True)
             batter_points += pts
-            if scoring or event_type in NOTABLE_BATTER_EVENTS:
-                batter_lines.append(f"{inning_label}: {desc} ({pts:+.1f} pts)")
+            statcast_suffix = _statcast_suffix(play) if include_statcast else ""
+            if include_all_batter_events:
+                batter_lines.append(f"{inning_label}: {desc}{statcast_suffix} ({pts:+.1f} pts)")
+            elif scoring or event_type in NOTABLE_BATTER_EVENTS:
+                batter_lines.append(f"{inning_label}: {desc}{statcast_suffix} ({pts:+.1f} pts)")
 
         pitcher_id = matchup.get("pitcher", {}).get("id")
         if pitcher_id == player_id:
@@ -1428,7 +1437,12 @@ def _build_player_day_report(target_date: date, requested_name: str, nicknames: 
     batting = box_entry.get("stats", {}).get("batting", {})
     pitching = box_entry.get("stats", {}).get("pitching", {})
 
-    batter_lines, pitcher_lines, batter_points, pitcher_points = _player_play_lines(feed, player_id)
+    batter_lines, pitcher_lines, batter_points, pitcher_points = _player_play_lines(
+        feed,
+        player_id,
+        include_all_batter_events=True,
+        include_statcast=True,
+    )
     lines: list[str] = [f"{player_name} - {game_text} ({status})"]
 
     if batting:
@@ -1958,6 +1972,17 @@ def _build_final_summary(
                         f"{EVENT_EMOJIS['final']} Final {game_text}: {name} batting {hits}-{ab}, HR {hr}, RBI {rbi}, R {runs} | **{batting_points:.1f} pts**",
                         pid,
                     ))
+                    batter_play_lines, _, _, _ = _player_play_lines(
+                        feed,
+                        pid,
+                        include_all_batter_events=True,
+                        include_statcast=True,
+                    )
+                    if batter_play_lines:
+                        lines.append((
+                            f"{EVENT_EMOJIS['final']} Final {game_text}: {name} AB log:\n" + "\n".join(batter_play_lines[:20]),
+                            pid,
+                        ))
 
             if pitching:
                 ip = str(pitching.get("inningsPitched", "0.0"))

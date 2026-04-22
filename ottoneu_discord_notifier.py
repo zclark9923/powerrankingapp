@@ -537,6 +537,20 @@ def load_watchlist_from_html_files(
     return out
 
 
+def _extract_html_from_webarchive(webarchive_data: bytes) -> str | None:
+    """Attempt to extract HTML content from a macOS Safari .webarchive file (plist format)."""
+    import plistlib
+    try:
+        plist = plistlib.loads(webarchive_data)
+        main_resource = plist.get("WebMainResource", {})
+        html_data = main_resource.get("WebResourceData")
+        if isinstance(html_data, bytes):
+            return html_data.decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return None
+
+
 def fetch_discord_html_attachments(
     channel_id: str,
     bot_token: str,
@@ -566,10 +580,23 @@ def fetch_discord_html_attachments(
             if not filename or not url or url in seen_urls:
                 continue
             lower_name = filename.lower()
-            is_supported_page = lower_name.endswith((".html", ".htm", ".mht", ".mhtml"))
+            is_supported_page = lower_name.endswith((".html", ".htm", ".mht", ".mhtml", ".webarchive"))
             if not is_supported_page and "text/html" not in content_type and "message/rfc822" not in content_type:
                 continue
-            html_files.append((filename, _http_text(url)))
+            
+            # Download file content (text for HTML, binary for webarchive)
+            if lower_name.endswith(".webarchive"):
+                try:
+                    req = Request(url, headers={"User-Agent": "ottoneu-discord-notifier/1.0"})
+                    with urlopen(req, timeout=20) as resp:
+                        webarchive_bytes = resp.read()
+                    extracted_html = _extract_html_from_webarchive(webarchive_bytes)
+                    if extracted_html:
+                        html_files.append((filename, extracted_html))
+                except Exception as exc:
+                    print(f"Warning: Failed to extract HTML from {filename}: {exc}")
+            else:
+                html_files.append((filename, _http_text(url)))
             seen_urls.add(url)
 
     return html_files
@@ -723,7 +750,7 @@ def _roll_state_for_date(state: dict[str, Any], target_date: date) -> None:
 
 def _discord_attachment_supported(filename: str, content_type: str) -> bool:
     lower_name = filename.lower()
-    return lower_name.endswith((".html", ".htm", ".mht", ".mhtml")) or (
+    return lower_name.endswith((".html", ".htm", ".mht", ".mhtml", ".webarchive")) or (
         "text/html" in content_type or "message/rfc822" in content_type
     )
 
@@ -772,7 +799,21 @@ def load_watchlist_from_discord_attachment(
     bridge_id_map: dict[int, int],
     role: str,
 ) -> dict[int, WatchPlayer]:
-    html = _http_text(attachment.url)
+    # Handle both regular HTML and macOS webarchive formats
+    if attachment.filename.lower().endswith(".webarchive"):
+        try:
+            req = Request(attachment.url, headers={"User-Agent": "ottoneu-discord-notifier/1.0"})
+            with urlopen(req, timeout=20) as resp:
+                webarchive_bytes = resp.read()
+            html = _extract_html_from_webarchive(webarchive_bytes)
+            if not html:
+                raise ValueError("Could not extract HTML from webarchive")
+        except Exception as exc:
+            print(f"Error extracting HTML from {attachment.filename}: {exc}")
+            return {}
+    else:
+        html = _http_text(attachment.url)
+    
     with tempfile.TemporaryDirectory(prefix="ottoneu_discord_html_") as tmpdir:
         safe_name = Path(attachment.filename).name or "discord_upload.html"
         path = Path(tmpdir) / safe_name

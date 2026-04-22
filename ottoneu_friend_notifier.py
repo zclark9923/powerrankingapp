@@ -182,6 +182,8 @@ class DiscordCommandMessage:
     message_id: str
     author_id: str
     content: str
+    source: str = "poll"
+    created_at: str = ""
 
 
 class _AnchorCollector(HTMLParser):
@@ -371,9 +373,29 @@ def fetch_discord_command_messages(
                 message_id=message_id,
                 author_id=author_id,
                 content=content,
+                source="poll",
+                created_at=str(message.get("timestamp", "") or ""),
             )
         )
     return messages
+
+
+def _command_message_age_seconds(created_at: str) -> float | None:
+    stamp = str(created_at or "").strip()
+    if not stamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+
+
+def _effective_command_poll_seconds(args: argparse.Namespace) -> int:
+    configured = int(max(1, args.discord_command_poll_seconds))
+    if args.discord_command_mode == "push":
+        return max(2, min(5, configured))
+    return max(5, configured)
 
 
 def send_discord_channel_message(
@@ -564,6 +586,8 @@ class DiscordGatewayCommandListener:
                             message_id=message_id,
                             author_id=author_id,
                             content=content,
+                            source="push",
+                            created_at=str(data.get("timestamp", "") or ""),
                         )
                     )
             except Exception as exc:  # noqa: BLE001
@@ -1435,6 +1459,8 @@ def process_discord_text_commands(
 
         command_text = content[len(prefix):].strip()
         command = command_text.lower() if command_text else "help"
+        command_source = str(message.source or "poll").strip().lower() or "poll"
+        age_seconds = _command_message_age_seconds(message.created_at)
         response = ""
 
         if command in {"help", "?"}:
@@ -1492,6 +1518,16 @@ def process_discord_text_commands(
             response = _build_player_day_report(target_date, requested_name)
         else:
             response = f"Unknown command '{command_text}'. Try: {prefix} help"
+
+        if getattr(args, "discord_command_debug", False):
+            age_text = f"{age_seconds:.1f}s" if age_seconds is not None else "n/a"
+            print(
+                f"Command '{command_text or 'help'}' via {command_source} "
+                f"(message {message.message_id}, age {age_text})"
+            )
+        if getattr(args, "discord_command_debug_reply", False):
+            age_text = f"{age_seconds:.1f}s" if age_seconds is not None else "n/a"
+            response = f"{response}\nDebug: source={command_source}, age={age_text}"
 
         try:
             send_discord_channel_message(
@@ -2302,6 +2338,18 @@ def parse_args() -> argparse.Namespace:
         help="Command intake mode: push via Discord Gateway, or poll via REST",
     )
     parser.add_argument(
+        "--discord-command-debug",
+        action="store_true",
+        default=os.getenv("DISCORD_COMMAND_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"},
+        help="Log command intake diagnostics (source and message age)",
+    )
+    parser.add_argument(
+        "--discord-command-debug-reply",
+        action="store_true",
+        default=os.getenv("DISCORD_COMMAND_DEBUG_REPLY", "0").strip().lower() in {"1", "true", "yes", "on"},
+        help="Append command intake debug details to command replies",
+    )
+    parser.add_argument(
         "--no-csv-watchlist",
         action="store_true",
         help="Ignore local watchlist CSV and use Ottoneu game URLs only",
@@ -2545,6 +2593,11 @@ def main() -> int:
                 f"Command channel enabled: {args.discord_command_channel_id} "
                 f"(prefix '{args.discord_command_prefix}', poll {args.discord_command_poll_seconds}s)"
             )
+        if args.discord_command_debug:
+            print(
+                f"Command debug enabled (reply={args.discord_command_debug_reply}, "
+                f"fallback poll {_effective_command_poll_seconds(args)}s)"
+            )
 
     next_watchlist_refresh_at = 0.0
     next_command_poll_at = 0.0
@@ -2602,7 +2655,7 @@ def main() -> int:
             or (args.discord_command_mode == "push" and args.discord_command_poll_seconds > 0)
         )
         if args.discord_command_channel_id and should_poll_commands and now_ts >= next_command_poll_at:
-            next_command_poll_at = now_ts + max(5, args.discord_command_poll_seconds)
+            next_command_poll_at = now_ts + _effective_command_poll_seconds(args)
             discord_watchlist, watchlist, team_ids = process_discord_text_commands(
                 state=state,
                 args=args,
@@ -2780,7 +2833,7 @@ def main() -> int:
                     or (args.discord_command_mode == "push" and args.discord_command_poll_seconds > 0)
                 )
                 if should_poll_commands and now_ts >= next_command_poll_at:
-                    next_command_poll_at = now_ts + max(5, args.discord_command_poll_seconds)
+                    next_command_poll_at = now_ts + _effective_command_poll_seconds(args)
                     discord_watchlist, watchlist, team_ids = process_discord_text_commands(
                         state=state,
                         args=args,

@@ -945,8 +945,10 @@ def load_watchlist_from_discord_html_attachments(
     out: dict[int, WatchPlayer] = {}
     with tempfile.TemporaryDirectory(prefix="ottoneu_discord_html_") as tmpdir:
         html_paths: list[Path] = []
-        for filename, html in html_files:
-            safe_name = Path(filename).name or "discord_upload.html"
+        for idx, (filename, html) in enumerate(html_files):
+            stem = Path(filename).stem or "discord_upload"
+            suffix = Path(filename).suffix or ".html"
+            safe_name = f"{idx:02d}_{stem}{suffix}"
             path = Path(tmpdir) / safe_name
             path.write_text(html, encoding="utf-8")
             html_paths.append(path)

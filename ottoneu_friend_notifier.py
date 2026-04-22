@@ -84,9 +84,6 @@ NOTABLE_BATTER_EVENTS = {
 }
 
 NOTABLE_PITCHER_EVENTS = {
-    "strikeout",
-    "walk",
-    "hit_by_pitch",
     "home_run",
 }
 
@@ -1340,6 +1337,10 @@ def _batter_sabr_points_from_box(batting: dict[str, Any]) -> float:
 
 
 def _pitcher_sabr_points_from_box(pitching: dict[str, Any]) -> float:
+    return sum(_pitcher_sabr_component_points(pitching).values())
+
+
+def _pitcher_sabr_component_points(pitching: dict[str, Any]) -> dict[str, float]:
     innings = _ip_to_innings(pitching.get("inningsPitched", "0.0"))
     so = int(pitching.get("strikeOuts", 0) or 0)
     bb = int(pitching.get("baseOnBalls", 0) or 0)
@@ -1347,15 +1348,21 @@ def _pitcher_sabr_points_from_box(pitching: dict[str, Any]) -> float:
     hr = int(pitching.get("homeRuns", 0) or 0)
     saves = int(pitching.get("saves", 0) or 0)
     holds = int(pitching.get("holds", 0) or 0)
-    return (
-        innings * SABR_PITCHING_POINTS["ip"]
-        + so * SABR_PITCHING_POINTS["strikeout"]
-        + bb * SABR_PITCHING_POINTS["walk"]
-        + hbp * SABR_PITCHING_POINTS["hbp"]
-        + hr * SABR_PITCHING_POINTS["home_run"]
-        + saves * SABR_PITCHING_POINTS["save"]
-        + holds * SABR_PITCHING_POINTS["hold"]
-    )
+    return {
+        "IP": innings * SABR_PITCHING_POINTS["ip"],
+        "K": so * SABR_PITCHING_POINTS["strikeout"],
+        "BB": bb * SABR_PITCHING_POINTS["walk"],
+        "HBP": hbp * SABR_PITCHING_POINTS["hbp"],
+        "HR": hr * SABR_PITCHING_POINTS["home_run"],
+        "SV": saves * SABR_PITCHING_POINTS["save"],
+        "HLD": holds * SABR_PITCHING_POINTS["hold"],
+    }
+
+
+def _pitcher_sabr_breakdown_text(pitching: dict[str, Any]) -> str:
+    component_points = _pitcher_sabr_component_points(pitching)
+    parts = [f"{label} {points:+.1f}" for label, points in component_points.items() if abs(points) > 1e-9]
+    return ", ".join(parts) if parts else "No SABR scoring events"
 
 
 def _build_player_day_report(target_date: date, requested_name: str, nicknames: dict[int, str] | None = None) -> str:
@@ -1928,27 +1935,7 @@ def _build_final_summary(
 
             pitching_points = 0.0
             if pitching:
-                ip_str = str(pitching.get("inningsPitched", "0.0"))
-                try:
-                    ip_val = float(ip_str) if ip_str else 0.0
-                except ValueError:
-                    ip_val = 0.0
-                so = int(pitching.get("strikeOuts", 0) or 0)
-                bb = int(pitching.get("walks", 0) or 0)
-                hbp = int(pitching.get("hitByPitch", 0) or 0)
-                hr = int(pitching.get("homeRuns", 0) or 0)
-                sv = int(pitching.get("saves", 0) or 0)
-                holds = int(pitching.get("holds", 0) or 0)
-
-                pitching_points = (
-                    ip_val * SABR_PITCHING_POINTS["ip"]
-                    + so * SABR_PITCHING_POINTS["strikeout"]
-                    + bb * SABR_PITCHING_POINTS["walk"]
-                    + hbp * SABR_PITCHING_POINTS["hbp"]
-                    + hr * SABR_PITCHING_POINTS["home_run"]
-                    + sv * SABR_PITCHING_POINTS["save"]
-                    + holds * SABR_PITCHING_POINTS["hold"]
-                )
+                pitching_points = _pitcher_sabr_points_from_box(pitching)
 
             if batting:
                 ab = int(batting.get("atBats", 0) or 0)
@@ -1968,8 +1955,9 @@ def _build_final_summary(
                 er = int(pitching.get("earnedRuns", 0) or 0)
                 whip = pitching.get("whip", "-")
                 if ip != "0.0" or so > 0 or er > 0:
+                    breakdown = _pitcher_sabr_breakdown_text(pitching)
                     lines.append((
-                        f"{EVENT_EMOJIS['final']} Final {game_text}: {name} pitching {ip} IP, {so} K, {er} ER, WHIP {whip} | **{pitching_points:.1f} pts**",
+                        f"{EVENT_EMOJIS['final']} Final {game_text}: {name} pitching {ip} IP, {so} K, {er} ER, WHIP {whip} | {breakdown} | **{pitching_points:.1f} pts**",
                         pid,
                     ))
 
@@ -2019,7 +2007,17 @@ def _fetch_highlights(game_pk: int) -> list[dict]:
             )
         ):
             continue
-        clips.append({"clip_id": clip_id, "headline": headline, "mp4_url": mp4_url, "player_ids": player_ids})
+        headline_key = _ascii_name_key(headline)
+        url_path = Path(urlparse(mp4_url).path)
+        fallback_key = _ascii_name_key(url_path.stem)
+        dedupe_key = f"{game_pk}:{headline_key or fallback_key}:{','.join(str(pid) for pid in sorted(set(player_ids)))}"
+        clips.append({
+            "clip_id": clip_id,
+            "dedupe_key": dedupe_key,
+            "headline": headline,
+            "mp4_url": mp4_url,
+            "player_ids": player_ids,
+        })
     return clips
 
 
@@ -2281,29 +2279,18 @@ def process_game(
 
             so = int(pitching.get("strikeOuts", 0) or 0)
             bb = int(pitching.get("baseOnBalls", 0) or 0)
-            hbp = int(pitching.get("hitBatsmen", 0) or 0)
-            hr = int(pitching.get("homeRuns", 0) or 0)
-            sv = int(pitching.get("saves", 0) or 0)
-            holds = int(pitching.get("holds", 0) or 0)
             er = int(pitching.get("earnedRuns", 0) or 0)
             whip = pitching.get("whip", "-")
             ip = str(pitching.get("inningsPitched", "0.0"))
 
-            outing_points = (
-                (outs_recorded / 3.0) * SABR_PITCHING_POINTS["ip"]
-                + so * SABR_PITCHING_POINTS["strikeout"]
-                + bb * SABR_PITCHING_POINTS["walk"]
-                + hbp * SABR_PITCHING_POINTS["hbp"]
-                + hr * SABR_PITCHING_POINTS["home_run"]
-                + sv * SABR_PITCHING_POINTS["save"]
-                + holds * SABR_PITCHING_POINTS["hold"]
-            )
+            outing_points = _pitcher_sabr_points_from_box(pitching)
+            breakdown = _pitcher_sabr_breakdown_text(pitching)
             sign = "+" if outing_points >= 0 else ""
             api_obj = player_map.get(pid, {})
             name = _notification_name(api_obj, wp.name, player_id=pid, nicknames=nicknames)
             summary = (
                 f"{name} finished: {ip} IP, {so} K, {bb} BB, {er} ER, WHIP {whip}"
-                f" | **{sign}{outing_points:.1f} pts**"
+                f" | {breakdown} | **{sign}{outing_points:.1f} pts**"
             )
             send_webhook(
                 webhook_url,
@@ -2323,58 +2310,13 @@ def process_game(
             )
             sent_keys.add(outing_key)
 
-    # Pitcher 3-inning milestone alerts (fires at 3, 6, 9 IP)
-    for side in ("home", "away"):
-        for key, pobj in bs_teams.get(side, {}).get("players", {}).items():
-            if not key.startswith("ID"):
-                continue
-            try:
-                pid = int(key[2:])
-            except ValueError:
-                continue
-            if pid not in watchlist:
-                continue
-            wp = watchlist[pid]
-            if wp.role not in {"pitcher", "both"}:
-                continue
-            pitching = pobj.get("stats", {}).get("pitching", {})
-            if not pitching:
-                continue
-            try:
-                ip_val = float(str(pitching.get("inningsPitched", "0.0")))
-            except ValueError:
-                ip_val = 0.0
-            api_obj = player_map.get(pid, {})
-            name = _notification_name(api_obj, wp.name, player_id=pid, nicknames=nicknames)
-            for milestone in (3, 6, 9):
-                if ip_val >= milestone:
-                    milestone_key = f"{game_pk}:pitcher_milestone:{pid}:ip{milestone}"
-                    if milestone_key not in sent_keys:
-                        ip_pts = milestone * SABR_PITCHING_POINTS["ip"]
-                        send_webhook(
-                            webhook_url,
-                            f"{EVENT_EMOJIS['milestone']} {game_text}: {name} has completed {milestone} innings | **+{ip_pts:.1f} IP pts**",
-                            dry_run=dry_run,
-                            embeds=[
-                                _discord_embed(
-                                    title=f"{name} Milestone",
-                                    description=f"Completed {milestone} innings (+{ip_pts:.1f} IP pts)",
-                                    away_abbr=away_abbr,
-                                    home_abbr=home_abbr,
-                                    status=status,
-                                    color=0x3498DB,
-                                    player_id=pid,
-                                )
-                            ],
-                        )
-                        sent_keys.add(milestone_key)
-
     # --- Highlight clips (fires as clips become available, even mid-game) ---
     seen_clips: set[str] = set(state.get("seen_clips", []))
     starter_pitcher_ids = _starting_pitcher_ids(feed)
     for clip in _fetch_highlights(game_pk):
         clip_id = clip["clip_id"]
-        if clip_id in seen_clips:
+        clip_key = clip.get("dedupe_key") or clip_id
+        if clip_id in seen_clips or clip_key in seen_clips:
             continue
 
         watched_ids = [pid for pid in clip["player_ids"] if pid in watchlist]
@@ -2385,6 +2327,7 @@ def process_game(
         non_starter_matches = [pid for pid in watched_ids if pid not in starter_pitcher_ids]
         if not non_starter_matches:
             seen_clips.add(clip_id)
+            seen_clips.add(clip_key)
             continue
 
         send_webhook(
@@ -2393,6 +2336,7 @@ def process_game(
             dry_run=dry_run,
         )
         seen_clips.add(clip_id)
+        seen_clips.add(clip_key)
 
     if is_final:
         final_key = f"{game_pk}:final"

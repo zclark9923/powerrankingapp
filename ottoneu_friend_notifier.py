@@ -21,9 +21,11 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import tempfile
 import unicodedata
+from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from html.parser import HTMLParser
@@ -34,6 +36,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
+
+try:
+    import websocket  # type: ignore[import-not-found]
+except Exception:  # noqa: BLE001
+    websocket = None
 
 STATS_API = "https://statsapi.mlb.com/api/v1"
 LIVE_FEED_TEMPLATE = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
@@ -49,6 +56,7 @@ DEFAULT_IDLE_SECONDS = 900
 DEFAULT_WATCHLIST_REFRESH_SECONDS = 600
 DEFAULT_POSTFINAL_POLL_SECONDS = 300
 DEFAULT_POSTFINAL_HIGHLIGHT_SECONDS = 1800
+DISCORD_GATEWAY_INTENT_GUILD_MESSAGES = 1 << 9
 
 EVENT_EMOJIS = {
     "lineup": "🧢",
@@ -388,6 +396,183 @@ def send_discord_channel_message(
     )
     if status not in (200, 201):
         raise RuntimeError(f"Discord channel send failed with status {status}")
+
+
+class DiscordGatewayCommandListener:
+    def __init__(self, *, channel_id: str, bot_token: str) -> None:
+        self.channel_id = channel_id.strip()
+        self.bot_token = bot_token.strip()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._messages: deque[DiscordCommandMessage] = deque()
+        self._lock = threading.Lock()
+
+    def start(self) -> bool:
+        if websocket is None:
+            print("Discord push commands unavailable: install websocket-client")
+            return False
+        if not self.channel_id or not self.bot_token:
+            return False
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        self._thread = threading.Thread(target=self._run, name="discord-command-gateway", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=3)
+
+    def is_alive(self) -> bool:
+        thread = self._thread
+        return bool(thread and thread.is_alive())
+
+    def drain_messages(self) -> list[DiscordCommandMessage]:
+        with self._lock:
+            if not self._messages:
+                return []
+            drained = list(self._messages)
+            self._messages.clear()
+            return drained
+
+    def _enqueue(self, message: DiscordCommandMessage) -> None:
+        with self._lock:
+            self._messages.append(message)
+            while len(self._messages) > 500:
+                self._messages.popleft()
+
+    def _run(self) -> None:
+        sequence: int | None = None
+        session_id = ""
+        resume_url = ""
+        while not self._stop_event.is_set():
+            try:
+                gateway_payload = _http_json(
+                    f"{DISCORD_API}/gateway/bot",
+                    headers={"Authorization": f"Bot {self.bot_token}"},
+                )
+                base_gateway_url = str(gateway_payload.get("url", "")).strip()
+                if not base_gateway_url:
+                    raise RuntimeError("Discord gateway URL missing")
+                gateway_url = f"{base_gateway_url}?v=10&encoding=json"
+                ws = websocket.create_connection(gateway_url, timeout=30)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Discord gateway connect failed: {exc}")
+                if self._stop_event.wait(5):
+                    return
+                continue
+
+            try:
+                hello_raw = ws.recv()
+                hello = json.loads(hello_raw)
+                heartbeat_interval_ms = float(hello.get("d", {}).get("heartbeat_interval", 45000))
+                heartbeat_interval = max(5.0, heartbeat_interval_ms / 1000.0)
+
+                if session_id and resume_url:
+                    ws.send(
+                        json.dumps(
+                            {
+                                "op": 6,
+                                "d": {
+                                    "token": self.bot_token,
+                                    "session_id": session_id,
+                                    "seq": sequence,
+                                },
+                            }
+                        )
+                    )
+                else:
+                    ws.send(
+                        json.dumps(
+                            {
+                                "op": 2,
+                                "d": {
+                                    "token": self.bot_token,
+                                    "intents": DISCORD_GATEWAY_INTENT_GUILD_MESSAGES,
+                                    "properties": {
+                                        "os": "linux",
+                                        "browser": "ottoneu-notifier",
+                                        "device": "ottoneu-notifier",
+                                    },
+                                },
+                            }
+                        )
+                    )
+
+                next_heartbeat = time.time() + heartbeat_interval
+                while not self._stop_event.is_set():
+                    now = time.time()
+                    timeout = max(0.5, min(2.0, next_heartbeat - now))
+                    ws.settimeout(timeout)
+                    payload_raw = None
+                    try:
+                        payload_raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        pass
+
+                    now = time.time()
+                    if now >= next_heartbeat:
+                        ws.send(json.dumps({"op": 1, "d": sequence}))
+                        next_heartbeat = now + heartbeat_interval
+
+                    if payload_raw is None:
+                        continue
+
+                    payload = json.loads(payload_raw)
+                    op = int(payload.get("op", -1))
+                    seq = payload.get("s")
+                    if isinstance(seq, int):
+                        sequence = seq
+
+                    if op == 7:
+                        break
+                    if op == 9:
+                        session_id = ""
+                        resume_url = ""
+                        sequence = None
+                        break
+                    if op != 0:
+                        continue
+
+                    event = str(payload.get("t", ""))
+                    data = payload.get("d", {})
+                    if event == "READY":
+                        session_id = str(data.get("session_id", ""))
+                        resume_url = str(data.get("resume_gateway_url", "")).strip() or base_gateway_url
+                        continue
+                    if event != "MESSAGE_CREATE":
+                        continue
+
+                    if str(data.get("channel_id", "")).strip() != self.channel_id:
+                        continue
+                    author = data.get("author", {})
+                    if bool(author.get("bot", False)):
+                        continue
+                    message_id = str(data.get("id", "")).strip()
+                    author_id = str(author.get("id", "")).strip()
+                    content = str(data.get("content", "")).strip()
+                    if not message_id or not author_id or not content:
+                        continue
+                    self._enqueue(
+                        DiscordCommandMessage(
+                            message_id=message_id,
+                            author_id=author_id,
+                            content=content,
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001
+                if not self._stop_event.is_set():
+                    print(f"Discord gateway error: {exc}")
+            finally:
+                try:
+                    ws.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if self._stop_event.wait(2):
+                return
 
 
 def load_watchlist(path: Path) -> dict[int, WatchPlayer]:
@@ -1045,6 +1230,68 @@ def _player_play_lines(feed: dict[str, Any], player_id: int) -> tuple[list[str],
     return batter_lines, pitcher_lines, batter_points, pitcher_points
 
 
+def _ip_to_innings(ip_value: Any) -> float:
+    text = str(ip_value or "0.0").strip()
+    if not text:
+        return 0.0
+    try:
+        whole_str, frac_str = text.split(".", 1)
+        whole = int(whole_str)
+        frac = int(frac_str[:1] or "0")
+    except (ValueError, AttributeError):
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+    if frac == 1:
+        return whole + (1.0 / 3.0)
+    if frac == 2:
+        return whole + (2.0 / 3.0)
+    return float(whole)
+
+
+def _batter_sabr_points_from_box(batting: dict[str, Any]) -> float:
+    ab = int(batting.get("atBats", 0) or 0)
+    hits = int(batting.get("hits", 0) or 0)
+    doubles = int(batting.get("doubles", 0) or 0)
+    triples = int(batting.get("triples", 0) or 0)
+    hrs = int(batting.get("homeRuns", 0) or 0)
+    bb = int(batting.get("baseOnBalls", 0) or 0)
+    hbp = int(batting.get("hitByPitch", 0) or 0)
+    sb = int(batting.get("stolenBases", 0) or 0)
+    cs = int(batting.get("caughtStealing", 0) or 0)
+    return (
+        ab * SABR_HITTING_POINTS["at_bat"]
+        + hits * SABR_HITTING_POINTS["hit"]
+        + doubles * SABR_HITTING_POINTS["double"]
+        + triples * SABR_HITTING_POINTS["triple"]
+        + hrs * SABR_HITTING_POINTS["home_run"]
+        + bb * SABR_HITTING_POINTS["walk"]
+        + hbp * SABR_HITTING_POINTS["hbp"]
+        + sb * SABR_HITTING_POINTS["stolen_base"]
+        + cs * SABR_HITTING_POINTS["caught_stealing"]
+    )
+
+
+def _pitcher_sabr_points_from_box(pitching: dict[str, Any]) -> float:
+    innings = _ip_to_innings(pitching.get("inningsPitched", "0.0"))
+    so = int(pitching.get("strikeOuts", 0) or 0)
+    bb = int(pitching.get("baseOnBalls", 0) or 0)
+    hbp = int(pitching.get("hitBatsmen", 0) or 0)
+    hr = int(pitching.get("homeRuns", 0) or 0)
+    saves = int(pitching.get("saves", 0) or 0)
+    holds = int(pitching.get("holds", 0) or 0)
+    return (
+        innings * SABR_PITCHING_POINTS["ip"]
+        + so * SABR_PITCHING_POINTS["strikeout"]
+        + bb * SABR_PITCHING_POINTS["walk"]
+        + hbp * SABR_PITCHING_POINTS["hbp"]
+        + hr * SABR_PITCHING_POINTS["home_run"]
+        + saves * SABR_PITCHING_POINTS["save"]
+        + holds * SABR_PITCHING_POINTS["hold"]
+    )
+
+
 def _build_player_day_report(target_date: date, requested_name: str) -> str:
     target_key = _ascii_name_key(requested_name)
     if not target_key:
@@ -1108,8 +1355,9 @@ def _build_player_day_report(target_date: date, requested_name: str) -> str:
         rbi = int(batting.get("rbi", 0) or 0)
         hr = int(batting.get("homeRuns", 0) or 0)
         sb = int(batting.get("stolenBases", 0) or 0)
+        batter_total_points = _batter_sabr_points_from_box(batting)
         lines.append(
-            f"Batting: {h}-{ab}, R {r}, RBI {rbi}, HR {hr}, SB {sb} | event pts {batter_points:+.1f}"
+            f"Batting: {h}-{ab}, R {r}, RBI {rbi}, HR {hr}, SB {sb} | total pts {batter_total_points:+.1f}"
         )
     if pitching:
         ip = str(pitching.get("inningsPitched", "0.0"))
@@ -1118,8 +1366,9 @@ def _build_player_day_report(target_date: date, requested_name: str) -> str:
         er = int(pitching.get("earnedRuns", 0) or 0)
         h_allowed = int(pitching.get("hits", 0) or 0)
         whip = pitching.get("whip", "-")
+        pitcher_total_points = _pitcher_sabr_points_from_box(pitching)
         lines.append(
-            f"Pitching: {ip} IP, H {h_allowed}, K {so}, BB {bb}, ER {er}, WHIP {whip} | event pts {pitcher_points:+.1f}"
+            f"Pitching: {ip} IP, H {h_allowed}, K {so}, BB {bb}, ER {er}, WHIP {whip} | total pts {pitcher_total_points:+.1f}"
         )
 
     detail_lines: list[str] = []
@@ -1129,6 +1378,11 @@ def _build_player_day_report(target_date: date, requested_name: str) -> str:
         detail_lines.extend(["Pitcher plays:"] + pitcher_lines[:8])
 
     if detail_lines:
+        if batting:
+            detail_lines.insert(0, f"Batter notable-play pts: {batter_points:+.1f}")
+        if pitching:
+            insert_at = 1 if batting else 0
+            detail_lines.insert(insert_at, f"Pitcher notable-play pts: {pitcher_points:+.1f}")
         lines.extend(detail_lines)
     else:
         lines.append("No notable play events logged yet for this player today.")
@@ -1146,6 +1400,7 @@ def process_discord_text_commands(
     discord_watchlist: dict[int, WatchPlayer],
     watchlist: dict[int, WatchPlayer],
     team_ids: set[int],
+    messages: list[DiscordCommandMessage] | None = None,
 ) -> tuple[dict[int, WatchPlayer], dict[int, WatchPlayer], set[int]]:
     if not args.discord_command_channel_id.strip() or not args.discord_bot_token.strip():
         return discord_watchlist, watchlist, team_ids
@@ -1155,17 +1410,19 @@ def process_discord_text_commands(
     prefix = args.discord_command_prefix.strip() or "!ot"
     lower_prefix = prefix.lower()
 
-    try:
-        messages = fetch_discord_command_messages(
-            channel_id=args.discord_command_channel_id,
-            bot_token=args.discord_bot_token,
-            limit=max(1, args.discord_command_limit),
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"Discord command poll failed: {exc}")
-        return discord_watchlist, watchlist, team_ids
+    command_messages = messages
+    if command_messages is None:
+        try:
+            command_messages = fetch_discord_command_messages(
+                channel_id=args.discord_command_channel_id,
+                bot_token=args.discord_bot_token,
+                limit=max(1, args.discord_command_limit),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Discord command poll failed: {exc}")
+            return discord_watchlist, watchlist, team_ids
 
-    for message in messages:
+    for message in command_messages:
         if message.message_id in handled_set:
             continue
         content = message.content.strip()
@@ -1691,26 +1948,6 @@ def process_game(
     if watched_here:
         lineup_key = f"{game_pk}:lineup"
         if lineup_key not in announced_lineups:
-            names = []
-            for pid in watched_here:
-                base = watchlist[pid]
-                api_obj = player_map.get(pid, {})
-                names.append(_display_name(api_obj, base.name))
-            send_webhook(
-                webhook_url,
-                f"{EVENT_EMOJIS['lineup']} Lineup watch: {', '.join(sorted(names))} spotted in {game_text} ({status}).",
-                dry_run=dry_run,
-                embeds=[
-                    _discord_embed(
-                        title="Watchlist In Lineups",
-                        description=", ".join(sorted(names)),
-                        away_abbr=away_abbr,
-                        home_abbr=home_abbr,
-                        status=status,
-                        color=0x2ECC71,
-                    )
-                ],
-            )
             announced_lineups.add(lineup_key)
 
     plays_data = feed.get("liveData", {}).get("plays", {})
@@ -2054,6 +2291,13 @@ def parse_args() -> argparse.Namespace:
         help="How often to poll for command messages in the command channel",
     )
     parser.add_argument(
+        "--discord-command-mode",
+        type=str,
+        default=os.getenv("DISCORD_COMMAND_MODE", "push"),
+        choices=["push", "poll"],
+        help="Command intake mode: push via Discord Gateway, or poll via REST",
+    )
+    parser.add_argument(
         "--no-csv-watchlist",
         action="store_true",
         help="Ignore local watchlist CSV and use Ottoneu game URLs only",
@@ -2274,11 +2518,29 @@ def main() -> int:
     print(f"Idle poll interval: {args.idle_seconds}s")
     print(f"Watchlist refresh interval: {args.watchlist_refresh_seconds}s")
     print(f"Post-final highlight grace: {args.postfinal_highlight_seconds}s")
+    command_push_listener: DiscordGatewayCommandListener | None = None
     if args.discord_command_channel_id.strip():
-        print(
-            f"Command channel enabled: {args.discord_command_channel_id} "
-            f"(prefix '{args.discord_command_prefix}', poll {args.discord_command_poll_seconds}s)"
-        )
+        if args.discord_command_mode == "push":
+            command_push_listener = DiscordGatewayCommandListener(
+                channel_id=args.discord_command_channel_id,
+                bot_token=args.discord_bot_token,
+            )
+            if command_push_listener.start():
+                print(
+                    f"Command channel enabled: {args.discord_command_channel_id} "
+                    f"(prefix '{args.discord_command_prefix}', mode push)"
+                )
+            else:
+                command_push_listener = None
+                print(
+                    f"Command channel enabled: {args.discord_command_channel_id} "
+                    f"(prefix '{args.discord_command_prefix}', poll {args.discord_command_poll_seconds}s fallback)"
+                )
+        else:
+            print(
+                f"Command channel enabled: {args.discord_command_channel_id} "
+                f"(prefix '{args.discord_command_prefix}', poll {args.discord_command_poll_seconds}s)"
+            )
 
     next_watchlist_refresh_at = 0.0
     next_command_poll_at = 0.0
@@ -2314,8 +2576,25 @@ def main() -> int:
                         f"Activated new Discord upload watchlist with {len(discord_watchlist)} players"
                     )
 
-        if args.discord_command_channel_id and now_ts >= next_command_poll_at:
-            next_command_poll_at = now_ts + max(10, args.discord_command_poll_seconds)
+        push_ready = bool(command_push_listener and command_push_listener.is_alive())
+        if command_push_listener:
+            pushed_messages = command_push_listener.drain_messages()
+            if pushed_messages:
+                discord_watchlist, watchlist, team_ids = process_discord_text_commands(
+                    state=state,
+                    args=args,
+                    target_date=target_date,
+                    bridge_id_map=bridge_id_map,
+                    base_watchlist=base_watchlist,
+                    discord_watchlist=discord_watchlist,
+                    watchlist=watchlist,
+                    team_ids=team_ids,
+                    messages=pushed_messages,
+                )
+
+        should_poll_commands = args.discord_command_mode == "poll" or not push_ready
+        if args.discord_command_channel_id and should_poll_commands and now_ts >= next_command_poll_at:
+            next_command_poll_at = now_ts + max(5, args.discord_command_poll_seconds)
             discord_watchlist, watchlist, team_ids = process_discord_text_commands(
                 state=state,
                 args=args,
@@ -2463,16 +2742,33 @@ def main() -> int:
         else:
             sleep_seconds = args.idle_seconds
 
-        # Keep command responsiveness high by polling commands during sleep windows.
+        # Keep command responsiveness high during sleep windows.
         if args.discord_command_channel_id.strip() and args.discord_bot_token.strip():
             remaining = max(0, int(sleep_seconds))
             while remaining > 0:
-                step = min(5, remaining)
+                step = min(1, remaining)
                 time.sleep(step)
                 remaining -= step
                 now_ts = time.time()
-                if now_ts >= next_command_poll_at:
-                    next_command_poll_at = now_ts + max(10, args.discord_command_poll_seconds)
+                push_ready = bool(command_push_listener and command_push_listener.is_alive())
+                if command_push_listener:
+                    pushed_messages = command_push_listener.drain_messages()
+                    if pushed_messages:
+                        discord_watchlist, watchlist, team_ids = process_discord_text_commands(
+                            state=state,
+                            args=args,
+                            target_date=target_date,
+                            bridge_id_map=bridge_id_map,
+                            base_watchlist=base_watchlist,
+                            discord_watchlist=discord_watchlist,
+                            watchlist=watchlist,
+                            team_ids=team_ids,
+                            messages=pushed_messages,
+                        )
+
+                should_poll_commands = args.discord_command_mode == "poll" or not push_ready
+                if should_poll_commands and now_ts >= next_command_poll_at:
+                    next_command_poll_at = now_ts + max(5, args.discord_command_poll_seconds)
                     discord_watchlist, watchlist, team_ids = process_discord_text_commands(
                         state=state,
                         args=args,

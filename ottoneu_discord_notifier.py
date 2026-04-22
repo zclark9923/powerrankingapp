@@ -1388,14 +1388,24 @@ def _build_player_day_report(target_date: date, requested_name: str, nicknames: 
             continue
         players = _safe_player_map(feed)
         for pid, obj in players.items():
-            name = _display_name(obj, str(pid), player_id=pid, nicknames=nicknames)
-            name_key = _ascii_name_key(name)
-            if not name_key:
+            display_name = _display_name(obj, str(pid), player_id=pid, nicknames=nicknames)
+            original_name = (
+                obj.get("name")
+                or obj.get("fullName")
+                or obj.get("lastFirstName")
+                or str(pid)
+            )
+            candidate_keys = {
+                _ascii_name_key(display_name),
+                _ascii_name_key(original_name),
+            }
+            candidate_keys.discard("")
+            if not candidate_keys:
                 continue
-            row = (pid, name, game_pk, feed)
-            if name_key == target_key:
+            row = (pid, display_name, game_pk, feed)
+            if target_key in candidate_keys:
                 exact_matches.append(row)
-            elif target_key in name_key or name_key in target_key:
+            elif any(target_key in name_key or name_key in target_key for name_key in candidate_keys):
                 fuzzy_matches.append(row)
 
     matches = exact_matches or fuzzy_matches

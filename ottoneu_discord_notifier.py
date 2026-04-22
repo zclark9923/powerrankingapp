@@ -1343,8 +1343,8 @@ def _pitcher_sabr_points_from_box(pitching: dict[str, Any]) -> float:
 def _pitcher_sabr_component_points(pitching: dict[str, Any]) -> dict[str, float]:
     innings = _ip_to_innings(pitching.get("inningsPitched", "0.0"))
     so = int(pitching.get("strikeOuts", 0) or 0)
-    bb = int(pitching.get("baseOnBalls", 0) or 0)
-    hbp = int(pitching.get("hitBatsmen", 0) or 0)
+    bb = int(pitching.get("baseOnBalls", pitching.get("walks", 0)) or 0)
+    hbp = int(pitching.get("hitBatsmen", pitching.get("hitByPitch", 0)) or 0)
     hr = int(pitching.get("homeRuns", 0) or 0)
     saves = int(pitching.get("saves", 0) or 0)
     holds = int(pitching.get("holds", 0) or 0)
@@ -2265,13 +2265,19 @@ def process_game(
                 if key not in sent_keys:
                     # Calculate SABR points for this pitcher event
                     event_points = _event_sabr_points(event_type, is_batter=False)
-                    if pitcher_id not in running_points:
-                        running_points[pitcher_id] = 0.0
-                    running_points[pitcher_id] += event_points
+                    pitcher_total_points = event_points
+                    pitcher_box = _find_player_boxscore_entry(feed, pitcher_id) or {}
+                    pitcher_stats = pitcher_box.get("stats", {}).get("pitching", {}) if pitcher_box else {}
+                    if pitcher_stats:
+                        pitcher_total_points = _pitcher_sabr_points_from_box(pitcher_stats)
                     
                     msg = result.get("description") or f"{pitcher_name}: {event_type}"
                     sign = "+" if event_points >= 0 else ""
-                    points_str = f" | **{sign}{event_points:.1f} pts** (total: {running_points[pitcher_id]:.1f} pts)" if event_points != 0 else ""
+                    points_str = (
+                        f" | **{sign}{event_points:.1f} pts** (total: {pitcher_total_points:.1f} pts)"
+                        if event_points != 0
+                        else f" | total: {pitcher_total_points:.1f} pts"
+                    )
                     event_emoji = EVENT_EMOJIS.get(event_type, "⚾")
                     send_webhook(
                         webhook_url,

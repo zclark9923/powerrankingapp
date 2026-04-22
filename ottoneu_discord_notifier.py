@@ -1,0 +1,1878 @@
+"""Send Discord webhook alerts for watched Ottoneu lineup players during MLB games.
+
+Usage:
+    set DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+    python ottoneu_discord_notifier.py --watchlist ottoneu_lineup_watchlist.csv
+
+Optional env vars:
+    NOTIFIER_POLL_SECONDS=90
+    NOTIFIER_DATE=YYYY-MM-DD
+
+Watchlist CSV columns:
+    player_name,mlbam_id,role
+Where role is optional and one of: hitter, pitcher, both.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import time
+import tempfile
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from html.parser import HTMLParser
+from html import unescape
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+
+STATS_API = "https://statsapi.mlb.com/api/v1"
+LIVE_FEED_TEMPLATE = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+GAME_CONTENT_TEMPLATE = "https://statsapi.mlb.com/api/v1/game/{game_pk}/content"
+PEOPLE_TEMPLATE = "https://statsapi.mlb.com/api/v1/people/{player_id}?hydrate=currentTeam"
+PEOPLE_SEARCH_TEMPLATE = (
+    "https://statsapi.mlb.com/api/v1/people/search?names={name}&sportId=1"
+)
+STATE_PATH = Path(__file__).with_name("ottoneu_notifier_state.json")
+DEFAULT_WATCHLIST = Path(__file__).with_name("ottoneu_lineup_watchlist.csv")
+DISCORD_API = "https://discord.com/api/v10"
+DEFAULT_IDLE_SECONDS = 900
+DEFAULT_WATCHLIST_REFRESH_SECONDS = 600
+DEFAULT_POSTFINAL_POLL_SECONDS = 300
+DEFAULT_POSTFINAL_HIGHLIGHT_SECONDS = 1800
+
+EVENT_EMOJIS = {
+    "lineup": "🧢",
+    "single": "🟢",
+    "double": "🟠",
+    "triple": "🔺",
+    "home_run": "💥",
+    "strikeout": "🌀",
+    "stolen_base": "🛼",
+    "caught_stealing": "🚫",
+    "milestone": "📈",
+    "highlight": "🎬",
+    "final": "📊",
+}
+
+NOTABLE_BATTER_EVENTS = {
+    "home_run",
+    "triple",
+    "double",
+    "single",
+    "stolen_base",
+    "caught_stealing",
+}
+
+NOTABLE_PITCHER_EVENTS = {
+    "home_run",
+}
+
+# SABR Points scoring system
+SABR_HITTING_POINTS = {
+    "at_bat": -1.0,
+    "hit": 5.6,
+    "double": 2.9,
+    "triple": 5.7,
+    "home_run": 9.4,
+    "walk": 3.0,
+    "hbp": 3.0,
+    "stolen_base": 1.9,
+    "caught_stealing": -2.8,
+}
+
+SABR_PITCHING_POINTS = {
+    "ip": 5.0,
+    "strikeout": 2.0,
+    "walk": -3.0,
+    "hbp": -3.0,
+    "home_run": -13.0,
+    "save": 5.0,
+    "hold": 4.0,
+}
+
+CF_CHALLENGE_MARKERS = (
+    "just a moment",
+    "enable javascript and cookies to continue",
+    "cf-chl",
+    "cloudflare",
+)
+
+_NAME_RESOLVE_CACHE: dict[str, int | None] = {}
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        # Keep explicit shell env values higher priority than .env.
+        os.environ.setdefault(key, value)
+
+
+def bootstrap_env() -> None:
+    here = Path(__file__).resolve().parent
+    candidates = [here / ".env", Path.cwd() / ".env"]
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        load_env_file(candidate)
+
+
+bootstrap_env()
+
+
+@dataclass(frozen=True)
+class WatchPlayer:
+    player_id: int
+    name: str
+    role: str  # hitter | pitcher | both
+
+
+@dataclass(frozen=True)
+class DiscordHtmlAttachment:
+    message_id: str
+    created_at: str
+    filename: str
+    url: str
+
+
+class _AnchorCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchors: list[tuple[str, str]] = []
+        self._href_stack: list[str | None] = []
+        self._text_stack: list[list[str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        href = None
+        for key, value in attrs:
+            if key.lower() == "href":
+                href = value
+                break
+        self._href_stack.append(href)
+        self._text_stack.append([])
+
+    def handle_data(self, data: str) -> None:
+        if self._text_stack:
+            self._text_stack[-1].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self._href_stack or not self._text_stack:
+            return
+        href = self._href_stack.pop()
+        text = "".join(self._text_stack.pop()).strip()
+        if href:
+            self.anchors.append((href, text))
+
+
+def _to_utc(game_datetime: str | None) -> datetime | None:
+    if not game_datetime:
+        return None
+    try:
+        return datetime.fromisoformat(game_datetime.replace("Z", "+00:00")).astimezone(
+            timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _http_json(
+    url: str,
+    headers: dict[str, str] | None = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    req_headers = {"User-Agent": "ottoneu-discord-notifier/1.0"}
+    if headers:
+        req_headers.update(headers)
+    req = Request(url, headers=req_headers)
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _http_text(url: str, headers: dict[str, str] | None = None, timeout: int = 20) -> str:
+    req_headers = {"User-Agent": "ottoneu-discord-notifier/1.0"}
+    if headers:
+        req_headers.update(headers)
+    req = Request(url, headers=req_headers)
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _looks_like_cloudflare_challenge(html: str) -> bool:
+    lower = html.lower()
+    return any(marker in lower for marker in CF_CHALLENGE_MARKERS)
+
+
+def _playwright_page_html(url: str, cookie_header: str, timeout_ms: int = 30000) -> str:
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Playwright is not installed. Run: pip install playwright; "
+            "python -m playwright install chromium"
+        ) from exc
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context()
+        if cookie_header.strip():
+            context.set_extra_http_headers({"Cookie": cookie_header.strip()})
+
+        page = context.new_page()
+        try:
+            page.goto(
+                "https://ottoneu.fangraphs.com",
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
+            )
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except PlaywrightTimeoutError:
+            # Best effort: capture whatever rendered so far.
+            pass
+
+        page.wait_for_timeout(2000)
+        html = page.content()
+        context.close()
+        browser.close()
+    return html
+
+
+def _debug_dump_html(debug_dir: Path, url: str, html: str) -> None:
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    parsed = urlparse(url)
+    slug = parsed.path.strip("/").replace("/", "_") or "root"
+    out_file = debug_dir / f"ottoneu_{slug}.html"
+    out_file.write_text(html, encoding="utf-8")
+
+
+def fetch_ottoneu_page_html(url: str, cookie_header: str, fetch_mode: str) -> str:
+    headers: dict[str, str] = {}
+    if cookie_header.strip():
+        headers["Cookie"] = cookie_header.strip()
+
+    if fetch_mode == "http":
+        return _http_text(url, headers=headers)
+
+    if fetch_mode == "playwright":
+        return _playwright_page_html(url, cookie_header)
+
+    # auto mode: try http first, then fallback to playwright on challenge pages.
+    html = _http_text(url, headers=headers)
+    if _looks_like_cloudflare_challenge(html):
+        print("Cloudflare challenge detected; retrying with Playwright...")
+        return _playwright_page_html(url, cookie_header)
+    return html
+
+
+def _http_post_json(url: str, payload: dict[str, Any], timeout: int = 20) -> int:
+    data = json.dumps(payload).encode("utf-8")
+    req = Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "ottoneu-discord-notifier/1.0",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        return int(getattr(resp, "status", 200))
+
+
+def load_watchlist(path: Path) -> dict[int, WatchPlayer]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Watchlist not found: {path}. Create it from ottoneu_lineup_watchlist.csv."
+        )
+
+    players: dict[int, WatchPlayer] = {}
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"player_name", "mlbam_id"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError(
+                "Watchlist CSV must include headers: player_name,mlbam_id[,role]"
+            )
+
+        for row in reader:
+            raw_id = str(row.get("mlbam_id", "")).strip()
+            if not raw_id:
+                continue
+            try:
+                player_id = int(raw_id)
+            except ValueError:
+                continue
+
+            name = str(row.get("player_name", "")).strip() or f"Player {player_id}"
+            role = str(row.get("role", "both")).strip().lower() or "both"
+            if role not in {"hitter", "pitcher", "both"}:
+                role = "both"
+
+            players[player_id] = WatchPlayer(player_id=player_id, name=name, role=role)
+
+    if not players:
+        raise ValueError(f"No valid rows found in watchlist: {path}")
+    return players
+
+
+def load_bridge_id_map(path: Path) -> dict[int, int]:
+    """Parse master_bridge.csv Fantasy column (playercard?id=X) -> MLBAM ID."""
+    if not path.exists():
+        raise FileNotFoundError(f"Bridge CSV not found: {path}")
+    mapping: dict[int, int] = {}
+    id_re = re.compile(r"playercard\?id=(\d+)", re.IGNORECASE)
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fantasy_html = str(row.get("Fantasy", ""))
+            mlbam_raw = str(row.get("MLBAMID", "")).strip()
+            m = id_re.search(fantasy_html)
+            if not m or not mlbam_raw:
+                continue
+            try:
+                mapping[int(m.group(1))] = int(mlbam_raw)
+            except ValueError:
+                continue
+    if not mapping:
+        raise ValueError(f"No valid playercard?id -> MLBAMID rows found in {path}")
+    return mapping
+
+
+def parse_ottoneu_player_ids(page_html: str) -> set[int]:
+    """Extract Ottoneu player IDs from /players/{id} links in game HTML."""
+    return {
+        int(m.group(1))
+        for m in re.finditer(r'/players/(\d+)', page_html)
+    }
+
+
+def load_leaderboard_name_map(path: Path) -> dict[str, int]:
+    if not path.exists():
+        raise FileNotFoundError(f"Leaderboard CSV not found: {path}")
+
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = {
+            str(name).replace("\ufeff", "").strip() for name in (reader.fieldnames or [])
+        }
+        required = {"Name", "MLBAMID"}
+        if not required.issubset(fieldnames):
+            raise ValueError(
+                "Leaderboard CSV must include Name and MLBAMID columns"
+            )
+
+        mapping: dict[str, int] = {}
+        for row in reader:
+            name = str(row.get("Name", "")).strip()
+            raw_id = str(row.get("MLBAMID", "")).strip()
+            if not name or not raw_id:
+                continue
+            try:
+                mapping[name.lower()] = int(raw_id)
+            except ValueError:
+                continue
+
+    if not mapping:
+        raise ValueError(f"No valid Name/MLBAMID rows found in {path}")
+    return mapping
+
+
+def parse_ottoneu_player_names(
+    page_html: str,
+    leaderboard_name_map: dict[str, int] | None = None,
+) -> set[str]:
+    collector = _AnchorCollector()
+    collector.feed(page_html)
+
+    names: set[str] = set()
+    for href, raw_text in collector.anchors:
+        href_lower = href.lower()
+        if "/playercard" not in href_lower and "/players/" not in href_lower:
+            continue
+
+        name = unescape(raw_text).strip()
+        if len(name) < 3 or len(name) > 40:
+            continue
+        if not re.match(r"^[A-Za-z .'-]+$", name):
+            continue
+        if " " not in name:
+            continue
+        names.add(name)
+    if names:
+        return names
+
+    # Fallback: if we have a known name dictionary from FanGraphs exports,
+    # match those names against the page HTML when explicit player links are absent.
+    if leaderboard_name_map:
+        lower_html = page_html.lower()
+        for known_name in leaderboard_name_map:
+            if known_name in lower_html:
+                names.add(known_name.title())
+
+    return names
+
+
+def resolve_name_to_mlbam_id(
+    name: str,
+    leaderboard_name_map: dict[str, int] | None = None,
+) -> int | None:
+    if leaderboard_name_map:
+        mapped = leaderboard_name_map.get(name.lower())
+        if mapped is not None:
+            return mapped
+
+    cached = _NAME_RESOLVE_CACHE.get(name)
+    if name in _NAME_RESOLVE_CACHE:
+        return cached
+
+    url = PEOPLE_SEARCH_TEMPLATE.format(name=quote_plus(name))
+    try:
+        payload = _http_json(url)
+    except (HTTPError, URLError, TimeoutError):
+        _NAME_RESOLVE_CACHE[name] = None
+        return None
+
+    people = payload.get("people", [])
+    if not people:
+        _NAME_RESOLVE_CACHE[name] = None
+        return None
+
+    lower_name = name.lower()
+    exact = [
+        p
+        for p in people
+        if str(p.get("fullName", "")).strip().lower() == lower_name
+        and str(p.get("primaryPosition", {}).get("abbreviation", "")) != ""
+    ]
+    pick = exact[0] if exact else people[0]
+
+    pid = pick.get("id")
+    resolved = pid if isinstance(pid, int) else None
+    _NAME_RESOLVE_CACHE[name] = resolved
+    return resolved
+
+
+_MLBAM_NAME_CACHE: dict[int, str | None] = {}
+
+
+def _mlbam_to_name(mlbam_id: int) -> str | None:
+    if mlbam_id in _MLBAM_NAME_CACHE:
+        return _MLBAM_NAME_CACHE[mlbam_id]
+    url = PEOPLE_TEMPLATE.format(player_id=mlbam_id)
+    try:
+        payload = _http_json(url)
+    except (HTTPError, URLError, TimeoutError):
+        _MLBAM_NAME_CACHE[mlbam_id] = None
+        return None
+    people = payload.get("people", [])
+    name = str(people[0].get("fullName", "")).strip() if people else None
+    _MLBAM_NAME_CACHE[mlbam_id] = name or None
+    return _MLBAM_NAME_CACHE[mlbam_id]
+
+
+def load_watchlist_from_html_files(
+    html_paths: list[Path],
+    bridge_id_map: dict[int, int],
+    role: str,
+) -> dict[int, WatchPlayer]:
+    """Build watchlist by parsing local saved Ottoneu game HTML files.
+
+    Extracts /players/{id} links, resolves to MLBAM via bridge_id_map,
+    then looks up the player's name from the MLB Stats API.
+    """
+    out: dict[int, WatchPlayer] = {}
+    for path in html_paths:
+        if not path.exists():
+            print(f"Warning: HTML file not found: {path}")
+            continue
+        html = path.read_text(encoding="utf-8", errors="replace")
+        ottoneu_ids = parse_ottoneu_player_ids(html)
+        resolved = 0
+        for ott_id in ottoneu_ids:
+            mlbam = bridge_id_map.get(ott_id)
+            if mlbam is None:
+                continue
+            if mlbam in out:
+                resolved += 1
+                continue
+            # Fetch player name from MLB Stats API
+            name = _mlbam_to_name(mlbam)
+            out[mlbam] = WatchPlayer(player_id=mlbam, name=name or str(mlbam), role=role)
+            resolved += 1
+        print(f"{path.name}: found {len(ottoneu_ids)} player IDs, resolved {resolved} via bridge CSV")
+    return out
+
+
+def fetch_discord_html_attachments(
+    channel_id: str,
+    bot_token: str,
+    limit: int = 10,
+) -> list[tuple[str, str]]:
+    if not channel_id.strip():
+        raise ValueError("Discord HTML channel ID is required")
+    if not bot_token.strip():
+        raise ValueError("Discord bot token is required")
+
+    url = f"{DISCORD_API}/channels/{channel_id}/messages?limit={limit}"
+    headers = {"Authorization": f"Bot {bot_token.strip()}"}
+    payload = _http_json(url, headers=headers)
+    if not isinstance(payload, list):
+        raise RuntimeError("Unexpected Discord API response while reading channel messages")
+
+    html_files: list[tuple[str, str]] = []
+    seen_urls: set[str] = set()
+    for message in payload:
+        attachments = message.get("attachments", [])
+        if not isinstance(attachments, list):
+            continue
+        for attachment in attachments:
+            filename = str(attachment.get("filename", "")).strip()
+            url = str(attachment.get("url", "")).strip()
+            content_type = str(attachment.get("content_type", "")).strip().lower()
+            if not filename or not url or url in seen_urls:
+                continue
+            lower_name = filename.lower()
+            is_supported_page = lower_name.endswith((".html", ".htm", ".mht", ".mhtml"))
+            if not is_supported_page and "text/html" not in content_type and "message/rfc822" not in content_type:
+                continue
+            html_files.append((filename, _http_text(url)))
+            seen_urls.add(url)
+
+    return html_files
+
+
+def load_watchlist_from_discord_html_attachments(
+    channel_id: str,
+    bot_token: str,
+    bridge_id_map: dict[int, int],
+    role: str,
+    limit: int = 10,
+) -> dict[int, WatchPlayer]:
+    html_files = fetch_discord_html_attachments(
+        channel_id=channel_id,
+        bot_token=bot_token,
+        limit=limit,
+    )
+    if not html_files:
+        print("No Discord HTML attachments found in the configured channel")
+        return {}
+
+    out: dict[int, WatchPlayer] = {}
+    with tempfile.TemporaryDirectory(prefix="ottoneu_discord_html_") as tmpdir:
+        html_paths: list[Path] = []
+        for filename, html in html_files:
+            safe_name = Path(filename).name or "discord_upload.html"
+            path = Path(tmpdir) / safe_name
+            path.write_text(html, encoding="utf-8")
+            html_paths.append(path)
+        out.update(load_watchlist_from_html_files(html_paths, bridge_id_map, role))
+
+    print(f"Loaded {len(html_files)} HTML attachment(s) from Discord")
+    return out
+
+
+def load_watchlist_from_ottoneu_games(
+    game_urls: list[str],
+    role: str,
+    cookie_header: str,
+    fetch_mode: str,
+    debug_dir: Path | None = None,
+    leaderboard_name_map: dict[str, int] | None = None,
+) -> dict[int, WatchPlayer]:
+    if not game_urls:
+        return {}
+
+    out: dict[int, WatchPlayer] = {}
+    unresolved: list[str] = []
+    for url in game_urls:
+        try:
+            html = fetch_ottoneu_page_html(
+                url=url,
+                cookie_header=cookie_header,
+                fetch_mode=fetch_mode,
+            )
+        except HTTPError as exc:
+            if exc.code == 403:
+                raise RuntimeError(
+                    "Ottoneu returned 403. Provide --ottoneu-cookie-header or "
+                    "set OTTONEU_COOKIE_HEADER from a logged-in browser session."
+                ) from exc
+            raise
+
+        if debug_dir is not None:
+            _debug_dump_html(debug_dir, url, html)
+
+        if _looks_like_cloudflare_challenge(html):
+            raise RuntimeError(
+                "Ottoneu fetch returned a Cloudflare challenge page (not matchup HTML). "
+                "Try --ottoneu-fetch-mode playwright and verify browser/session access."
+            )
+
+        names = parse_ottoneu_player_names(html, leaderboard_name_map=leaderboard_name_map)
+        for name in names:
+            mlbam = resolve_name_to_mlbam_id(name, leaderboard_name_map)
+            if mlbam is None:
+                unresolved.append(name)
+                continue
+            out[mlbam] = WatchPlayer(player_id=mlbam, name=name, role=role)
+
+        print(f"{url}: extracted {len(names)} player names")
+
+    if unresolved:
+        sample = ", ".join(sorted(set(unresolved))[:10])
+        print(f"Warning: could not resolve MLBAM ID for some Ottoneu names: {sample}")
+    return out
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    default_state = {
+        "state_date": "",
+        "sent_keys": [],
+        "announced_lineups": [],
+        "final_summaries": [],
+        "seen_clips": [],
+        "final_game_times": {},
+        "discord_watchlist_cache": {},
+    }
+    if not path.exists():
+        return default_state.copy()
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default_state.copy()
+
+    for key, value in default_state.items():
+        state.setdefault(key, value)
+    return state
+
+
+def save_state(path: Path, state: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def _serialize_watchlist(watchlist: dict[int, WatchPlayer]) -> list[dict[str, Any]]:
+    return [
+        {"player_id": wp.player_id, "name": wp.name, "role": wp.role}
+        for wp in sorted(watchlist.values(), key=lambda item: item.player_id)
+    ]
+
+
+def _deserialize_watchlist(items: list[dict[str, Any]] | None) -> dict[int, WatchPlayer]:
+    out: dict[int, WatchPlayer] = {}
+    for item in items or []:
+        try:
+            player_id = int(item.get("player_id"))
+        except (TypeError, ValueError):
+            continue
+        name = str(item.get("name", "")).strip() or f"Player {player_id}"
+        role = str(item.get("role", "both")).strip().lower() or "both"
+        if role not in {"hitter", "pitcher", "both"}:
+            role = "both"
+        out[player_id] = WatchPlayer(player_id=player_id, name=name, role=role)
+    return out
+
+
+def _roll_state_for_date(state: dict[str, Any], target_date: date) -> None:
+    state_date = str(state.get("state_date", "")).strip()
+    target_key = target_date.isoformat()
+    if state_date == target_key:
+        return
+    state["state_date"] = target_key
+    state["sent_keys"] = []
+    state["announced_lineups"] = []
+    state["final_summaries"] = []
+    state["seen_clips"] = []
+    state["final_game_times"] = {}
+
+
+def _discord_attachment_supported(filename: str, content_type: str) -> bool:
+    lower_name = filename.lower()
+    return lower_name.endswith((".html", ".htm", ".mht", ".mhtml")) or (
+        "text/html" in content_type or "message/rfc822" in content_type
+    )
+
+
+def fetch_latest_discord_html_attachment(
+    channel_id: str,
+    bot_token: str,
+    limit: int = 10,
+) -> DiscordHtmlAttachment | None:
+    if not channel_id.strip():
+        raise ValueError("Discord HTML channel ID is required")
+    if not bot_token.strip():
+        raise ValueError("Discord bot token is required")
+
+    url = f"{DISCORD_API}/channels/{channel_id}/messages?limit={limit}"
+    headers = {"Authorization": f"Bot {bot_token.strip()}"}
+    payload = _http_json(url, headers=headers)
+    if not isinstance(payload, list):
+        raise RuntimeError("Unexpected Discord API response while reading channel messages")
+
+    for message in payload:
+        attachments = message.get("attachments", [])
+        if not isinstance(attachments, list):
+            continue
+        created_at = str(message.get("timestamp", "")).strip()
+        message_id = str(message.get("id", "")).strip()
+        for attachment in attachments:
+            filename = str(attachment.get("filename", "")).strip()
+            attachment_url = str(attachment.get("url", "")).strip()
+            content_type = str(attachment.get("content_type", "")).strip().lower()
+            if not filename or not attachment_url:
+                continue
+            if not _discord_attachment_supported(filename, content_type):
+                continue
+            return DiscordHtmlAttachment(
+                message_id=message_id,
+                created_at=created_at,
+                filename=filename,
+                url=attachment_url,
+            )
+    return None
+
+
+def load_watchlist_from_discord_attachment(
+    attachment: DiscordHtmlAttachment,
+    bridge_id_map: dict[int, int],
+    role: str,
+) -> dict[int, WatchPlayer]:
+    html = _http_text(attachment.url)
+    with tempfile.TemporaryDirectory(prefix="ottoneu_discord_html_") as tmpdir:
+        safe_name = Path(attachment.filename).name or "discord_upload.html"
+        path = Path(tmpdir) / safe_name
+        path.write_text(html, encoding="utf-8")
+        out = load_watchlist_from_html_files([path], bridge_id_map, role)
+    print(
+        f"Loaded Discord upload {attachment.filename} ({attachment.created_at or 'unknown time'})"
+    )
+    return out
+
+
+def refresh_discord_watchlist_cache(
+    state: dict[str, Any],
+    channel_id: str,
+    bot_token: str,
+    bridge_id_map: dict[int, int],
+    role: str,
+    limit: int = 10,
+) -> tuple[dict[int, WatchPlayer], bool]:
+    cache = state.get("discord_watchlist_cache", {})
+    cached_watchlist = _deserialize_watchlist(cache.get("players"))
+
+    latest = fetch_latest_discord_html_attachment(
+        channel_id=channel_id,
+        bot_token=bot_token,
+        limit=limit,
+    )
+    if latest is None:
+        if cached_watchlist:
+            print("No new Discord upload found; keeping cached watchlist")
+        return cached_watchlist, False
+
+    same_upload = (
+        str(cache.get("message_id", "")).strip() == latest.message_id
+        and str(cache.get("upload_url", "")).strip() == latest.url
+    )
+    if same_upload and cached_watchlist:
+        return cached_watchlist, False
+
+    new_watchlist = load_watchlist_from_discord_attachment(
+        attachment=latest,
+        bridge_id_map=bridge_id_map,
+        role=role,
+    )
+    state["discord_watchlist_cache"] = {
+        "message_id": latest.message_id,
+        "created_at": latest.created_at,
+        "filename": latest.filename,
+        "upload_url": latest.url,
+        "players": _serialize_watchlist(new_watchlist),
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return new_watchlist, True
+
+
+def game_schedule(target_date: date) -> list[dict[str, Any]]:
+    url = (
+        f"{STATS_API}/schedule?sportId=1&date={target_date.isoformat()}"
+        "&hydrate=team,linescore"
+    )
+    payload = _http_json(url)
+    games: list[dict[str, Any]] = []
+    for day in payload.get("dates", []):
+        games.extend(day.get("games", []))
+    return games
+
+
+def watched_team_ids(watchlist: dict[int, WatchPlayer]) -> set[int]:
+    teams: set[int] = set()
+    for pid in watchlist:
+        try:
+            payload = _http_json(PEOPLE_TEMPLATE.format(player_id=pid))
+        except (HTTPError, URLError, TimeoutError):
+            continue
+        people = payload.get("people", [])
+        if not people:
+            continue
+        team_id = people[0].get("currentTeam", {}).get("id")
+        if isinstance(team_id, int):
+            teams.add(team_id)
+    return teams
+
+
+def tracked_games_for_watchlist(
+    schedule_games: list[dict[str, Any]],
+    watch_team_ids: set[int],
+) -> list[dict[str, Any]]:
+    tracked: list[dict[str, Any]] = []
+    for game in schedule_games:
+        teams = game.get("teams", {})
+        away_id = teams.get("away", {}).get("team", {}).get("id")
+        home_id = teams.get("home", {}).get("team", {}).get("id")
+        if away_id in watch_team_ids or home_id in watch_team_ids:
+            tracked.append(game)
+    return tracked
+
+
+def game_status_bucket(game: dict[str, Any]) -> str:
+    abstract_state = str(game.get("status", {}).get("abstractGameState", "")).strip()
+    detailed = str(game.get("status", {}).get("detailedState", "")).strip()
+    lower_detailed = detailed.lower()
+
+    if abstract_state in {"Live", "Manager Challenge"}:
+        return "live"
+    if abstract_state == "Final":
+        return "final"
+    if abstract_state in {"Preview", "Pre-Game", "Warmup"}:
+        return "pregame"
+    if "postponed" in lower_detailed or "suspended" in lower_detailed:
+        return "postponed"
+    return "other"
+
+
+def game_label_from_schedule(game: dict[str, Any]) -> str:
+    teams = game.get("teams", {})
+    away = teams.get("away", {}).get("team", {}).get("abbreviation", "AWAY")
+    home = teams.get("home", {}).get("team", {}).get("abbreviation", "HOME")
+    return f"{away} @ {home}"
+
+
+def _safe_player_map(feed: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    players = feed.get("gameData", {}).get("players", {})
+    out: dict[int, dict[str, Any]] = {}
+    for key, player_obj in players.items():
+        if key.startswith("ID"):
+            try:
+                out[int(key[2:])] = player_obj
+            except ValueError:
+                continue
+    return out
+
+
+def _display_name(player_obj: dict[str, Any], fallback: str) -> str:
+    return (
+        player_obj.get("name")
+        or player_obj.get("fullName")
+        or player_obj.get("lastFirstName")
+        or fallback
+    )
+
+
+def _game_label(feed: dict[str, Any]) -> str:
+    gd = feed.get("gameData", {})
+    teams = gd.get("teams", {})
+    away = teams.get("away", {}).get("abbreviation", "AWAY")
+    home = teams.get("home", {}).get("abbreviation", "HOME")
+    return f"{away} @ {home}"
+
+
+def _team_logo_url(team_abbr: str) -> str:
+    """Return a Discord-friendly MLB team logo URL (PNG)."""
+    return f"https://a.espncdn.com/i/teamlogos/mlb/500/{team_abbr.lower()}.png"
+
+
+def _player_headshot_url(player_id: int) -> str:
+    return (
+        "https://img.mlbstatic.com/mlb-photos/image/upload/"
+        f"w_213,q_auto:best/v1/people/{player_id}/headshot/67/current"
+    )
+
+
+def _discord_embed(
+    title: str,
+    description: str,
+    away_abbr: str,
+    home_abbr: str,
+    status: str,
+    color: int,
+    player_id: int | None = None,
+) -> dict[str, Any]:
+    embed: dict[str, Any] = {
+        "title": title,
+        "description": description,
+        "color": color,
+        "author": {
+            "name": f"{away_abbr} @ {home_abbr}",
+            "icon_url": _team_logo_url(away_abbr),
+        },
+        "footer": {
+            "text": status,
+            "icon_url": _team_logo_url(home_abbr),
+        },
+    }
+    if player_id is not None:
+        embed["thumbnail"] = {"url": _player_headshot_url(player_id)}
+    return embed
+
+
+def _status_label(feed: dict[str, Any]) -> str:
+    st = feed.get("gameData", {}).get("status", {})
+    return st.get("detailedState") or st.get("abstractGameState") or "Unknown"
+
+
+def send_webhook(
+    webhook_url: str,
+    message: str,
+    dry_run: bool = False,
+    embeds: list[dict[str, Any]] | None = None,
+) -> None:
+    if dry_run:
+        out = f"[DRY RUN] {message}"
+        if embeds:
+            out += " [embed]"
+        try:
+            print(out)
+        except UnicodeEncodeError:
+            # Windows cp1252 consoles can fail on emoji; replace unsupported chars.
+            print(out.encode("cp1252", errors="replace").decode("cp1252"))
+        return
+
+    if embeds:
+        payload: dict[str, Any] = {"embeds": embeds}
+    else:
+        payload = {"content": message}
+    status = _http_post_json(webhook_url, payload)
+    if status not in (200, 204):
+        raise RuntimeError(f"Discord webhook returned status {status}")
+
+
+def _lineup_presence_ids(feed: dict[str, Any]) -> set[int]:
+    ids: set[int] = set()
+    boxscore = feed.get("liveData", {}).get("boxscore", {})
+    teams = boxscore.get("teams", {})
+    for side in ("home", "away"):
+        team_players = teams.get(side, {}).get("players", {})
+        for key in team_players:
+            if key.startswith("ID"):
+                try:
+                    ids.add(int(key[2:]))
+                except ValueError:
+                    continue
+    return ids
+
+
+def _build_final_summary(
+    game_text: str,
+    feed: dict[str, Any],
+    watchlist: dict[int, WatchPlayer],
+) -> list[tuple[str, int]]:
+    """Build final game summary including SABR points for watched players."""
+    lines: list[tuple[str, int]] = []
+    teams = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
+
+    for side in ("home", "away"):
+        players = teams.get(side, {}).get("players", {})
+        for key, pobj in players.items():
+            if not key.startswith("ID"):
+                continue
+            try:
+                pid = int(key[2:])
+            except ValueError:
+                continue
+            if pid not in watchlist:
+                continue
+
+            wp = watchlist[pid]
+            name = wp.name
+            batting = pobj.get("stats", {}).get("batting", {})
+            pitching = pobj.get("stats", {}).get("pitching", {})
+
+            batting_points = 0.0
+            if batting:
+                ab = int(batting.get("atBats", 0) or 0)
+                hits = int(batting.get("hits", 0) or 0)
+                doubles = int(batting.get("doubles", 0) or 0)
+                triples = int(batting.get("triples", 0) or 0)
+                hrs = int(batting.get("homeRuns", 0) or 0)
+                bb = int(batting.get("baseOnBalls", 0) or 0)
+                hbp = int(batting.get("hitByPitch", 0) or 0)
+                sb = int(batting.get("stolenBases", 0) or 0)
+                cs = int(batting.get("caughtStealing", 0) or 0)
+
+                batting_points = (
+                    ab * SABR_HITTING_POINTS["at_bat"]
+                    + hits * SABR_HITTING_POINTS["hit"]
+                    + doubles * SABR_HITTING_POINTS["double"]
+                    + triples * SABR_HITTING_POINTS["triple"]
+                    + hrs * SABR_HITTING_POINTS["home_run"]
+                    + bb * SABR_HITTING_POINTS["walk"]
+                    + hbp * SABR_HITTING_POINTS["hbp"]
+                    + sb * SABR_HITTING_POINTS["stolen_base"]
+                    + cs * SABR_HITTING_POINTS["caught_stealing"]
+                )
+
+            pitching_points = 0.0
+            if pitching:
+                ip_str = str(pitching.get("inningsPitched", "0.0"))
+                try:
+                    ip_val = float(ip_str) if ip_str else 0.0
+                except ValueError:
+                    ip_val = 0.0
+                so = int(pitching.get("strikeOuts", 0) or 0)
+                bb = int(pitching.get("walks", 0) or 0)
+                hbp = int(pitching.get("hitByPitch", 0) or 0)
+                hr = int(pitching.get("homeRuns", 0) or 0)
+                sv = int(pitching.get("saves", 0) or 0)
+                holds = int(pitching.get("holds", 0) or 0)
+
+                pitching_points = (
+                    ip_val * SABR_PITCHING_POINTS["ip"]
+                    + so * SABR_PITCHING_POINTS["strikeout"]
+                    + bb * SABR_PITCHING_POINTS["walk"]
+                    + hbp * SABR_PITCHING_POINTS["hbp"]
+                    + hr * SABR_PITCHING_POINTS["home_run"]
+                    + sv * SABR_PITCHING_POINTS["save"]
+                    + holds * SABR_PITCHING_POINTS["hold"]
+                )
+
+            if batting:
+                ab = int(batting.get("atBats", 0) or 0)
+                hits = int(batting.get("hits", 0) or 0)
+                hr = int(batting.get("homeRuns", 0) or 0)
+                rbi = int(batting.get("rbi", 0) or 0)
+                runs = int(batting.get("runs", 0) or 0)
+                if ab > 0 or hits > 0 or hr > 0 or rbi > 0 or runs > 0:
+                    lines.append((
+                        f"{EVENT_EMOJIS['final']} Final {game_text}: {name} batting {hits}-{ab}, HR {hr}, RBI {rbi}, R {runs} | **{batting_points:.1f} pts**",
+                        pid,
+                    ))
+
+            if pitching:
+                ip = str(pitching.get("inningsPitched", "0.0"))
+                so = int(pitching.get("strikeOuts", 0) or 0)
+                er = int(pitching.get("earnedRuns", 0) or 0)
+                whip = pitching.get("whip", "-")
+                if ip != "0.0" or so > 0 or er > 0:
+                    lines.append((
+                        f"{EVENT_EMOJIS['final']} Final {game_text}: {name} pitching {ip} IP, {so} K, {er} ER, WHIP {whip} | **{pitching_points:.1f} pts**",
+                        pid,
+                    ))
+
+    return lines
+
+
+def _fetch_highlights(game_pk: int) -> list[dict]:
+    """Fetch highlight clips for a game. Returns list of {clip_id, headline, mp4_url, player_ids}."""
+    try:
+        content = _http_json(GAME_CONTENT_TEMPLATE.format(game_pk=game_pk))
+    except Exception:
+        return []
+    items = content.get("highlights", {}).get("highlights", {}).get("items", [])
+    clips = []
+    for item in items:
+        clip_id = item.get("mediaPlaybackId") or item.get("id", "")
+        if not clip_id:
+            continue
+        headline = item.get("headline", "")
+        mp4_url = next(
+            (pb.get("url", "") for pb in item.get("playbacks", []) if pb.get("name") == "mp4Avc"),
+            "",
+        )
+        if not mp4_url:
+            continue
+        player_ids = [
+            int(kw["value"])
+            for kw in item.get("keywordsAll", [])
+            if kw.get("type") == "player_id" and str(kw.get("value", "")).isdigit()
+        ]
+        lower_headline = headline.lower()
+        # Exclude utility/analysis packages so we keep mostly in-game play clips.
+        if any(
+            marker in lower_headline
+            for marker in (
+                "breaking down",
+                "distance behind",
+                "through bat tracking data",
+                "outing against",
+                "probable pitchers",
+                "starting lineups",
+                "bench availability",
+                "bullpen availability",
+                "fielding alignment",
+                "condensed game",
+                "recap",
+            )
+        ):
+            continue
+        clips.append({"clip_id": clip_id, "headline": headline, "mp4_url": mp4_url, "player_ids": player_ids})
+    return clips
+
+
+def _event_sabr_points(event_type: str, is_batter: bool = True) -> float:
+    """Get SABR points for a play event type.
+
+    Hitting: every at-bat costs AB (-1.0). Hits add H (+5.6) on top.
+    Extra-base hits stack their bonus: 2B adds +2.9, 3B adds +5.7, HR adds +9.4.
+    So a HR = -1.0 + 5.6 + 9.4 = +14.0 pts total for that plate appearance.
+    Walks and HBP are not ABs, so no -1.0 penalty.
+    """
+    if is_batter:
+        AB = SABR_HITTING_POINTS["at_bat"]   # -1.0
+        H  = SABR_HITTING_POINTS["hit"]       # +5.6
+        lookup = {
+            # AB + H
+            "single":          AB + H,
+            # AB + H + extra-base bonus
+            "double":          AB + H + SABR_HITTING_POINTS["double"],
+            "triple":          AB + H + SABR_HITTING_POINTS["triple"],
+            "home_run":        AB + H + SABR_HITTING_POINTS["home_run"],
+            # Not an AB, no H
+            "walk":            SABR_HITTING_POINTS["walk"],
+            "hit_by_pitch":    SABR_HITTING_POINTS["hbp"],
+            # Baserunning events (no AB) — match e.g. stolen_base_2b, caught_stealing_3b
+            "stolen_base":     SABR_HITTING_POINTS["stolen_base"],
+            "caught_stealing": SABR_HITTING_POINTS["caught_stealing"],
+        }
+        # Exact match first, then prefix match for suffixed variants
+        if event_type in lookup:
+            return lookup[event_type]
+        for prefix, val in (
+            ("stolen_base", SABR_HITTING_POINTS["stolen_base"]),
+            ("caught_stealing", SABR_HITTING_POINTS["caught_stealing"]),
+        ):
+            if event_type.startswith(prefix):
+                return val
+        return 0.0
+    else:
+        lookup = {
+            "strikeout": SABR_PITCHING_POINTS["strikeout"],
+            "home_run":  SABR_PITCHING_POINTS["home_run"],
+            "walk":      SABR_PITCHING_POINTS["walk"],
+        }
+        return lookup.get(event_type, 0.0)
+
+
+def process_game(
+    game_pk: int,
+    watchlist: dict[int, WatchPlayer],
+    webhook_url: str,
+    state: dict[str, Any],
+    dry_run: bool,
+) -> bool:
+    feed = _http_json(LIVE_FEED_TEMPLATE.format(game_pk=game_pk))
+    game_text = _game_label(feed)
+    status = _status_label(feed)
+    teams = feed.get("gameData", {}).get("teams", {})
+    away_abbr = teams.get("away", {}).get("abbreviation", "AWAY")
+    home_abbr = teams.get("home", {}).get("abbreviation", "HOME")
+    sent_keys: set[str] = set(state.get("sent_keys", []))
+    announced_lineups: set[str] = set(state.get("announced_lineups", []))
+    final_summaries: set[str] = set(state.get("final_summaries", []))
+    
+    # Track running SABR points for players throughout the game
+    running_points: dict[int, float] = {}
+
+    player_map = _safe_player_map(feed)
+    present_ids = _lineup_presence_ids(feed)
+    watched_here = [pid for pid in watchlist if pid in present_ids]
+
+    if watched_here:
+        lineup_key = f"{game_pk}:lineup"
+        if lineup_key not in announced_lineups:
+            names = []
+            for pid in watched_here:
+                base = watchlist[pid]
+                api_obj = player_map.get(pid, {})
+                names.append(_display_name(api_obj, base.name))
+            send_webhook(
+                webhook_url,
+                f"{EVENT_EMOJIS['lineup']} Lineup watch: {', '.join(sorted(names))} spotted in {game_text} ({status}).",
+                dry_run=dry_run,
+                embeds=[
+                    _discord_embed(
+                        title="Watchlist In Lineups",
+                        description=", ".join(sorted(names)),
+                        away_abbr=away_abbr,
+                        home_abbr=home_abbr,
+                        status=status,
+                        color=0x2ECC71,
+                    )
+                ],
+            )
+            announced_lineups.add(lineup_key)
+
+    plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
+    for play in plays:
+        result = play.get("result", {})
+        about = play.get("about", {})
+        matchup = play.get("matchup", {})
+        at_bat_index = about.get("atBatIndex")
+        event_type = str(result.get("eventType", "")).lower().strip()
+        is_scoring = bool(about.get("isScoringPlay", False))
+        rbi = int(result.get("rbi", 0) or 0)
+
+        batter_id = matchup.get("batter", {}).get("id")
+        pitcher_id = matchup.get("pitcher", {}).get("id")
+
+        if isinstance(batter_id, int) and batter_id in watchlist:
+            wp = watchlist[batter_id]
+            is_notable_batter = (
+                event_type in NOTABLE_BATTER_EVENTS
+                or event_type.startswith("stolen_base")
+                or event_type.startswith("caught_stealing")
+            )
+            if wp.role in {"hitter", "both"} and (is_notable_batter or is_scoring):
+                key = f"{game_pk}:{at_bat_index}:batter:{batter_id}:{event_type}:{rbi}"
+                if key not in sent_keys:
+                    # Calculate SABR points for this event
+                    event_points = _event_sabr_points(event_type, is_batter=True)
+                    if batter_id not in running_points:
+                        running_points[batter_id] = 0.0
+                    running_points[batter_id] += event_points
+                    
+                    msg = result.get("description") or f"{wp.name}: {event_type}"
+                    sign = "+" if event_points >= 0 else ""
+                    points_str = f" | **{sign}{event_points:.1f} pts** (total: {running_points[batter_id]:.1f} pts)" if event_points != 0 else ""
+                    event_emoji = EVENT_EMOJIS.get(event_type, "⚾")
+                    send_webhook(
+                        webhook_url,
+                        f"{event_emoji} {game_text}: {wp.name} - {msg}{points_str}",
+                        dry_run=dry_run,
+                        embeds=[
+                            _discord_embed(
+                                title=f"{event_emoji} {wp.name} Alert",
+                                description=f"{event_emoji} {msg}{points_str}",
+                                away_abbr=away_abbr,
+                                home_abbr=home_abbr,
+                                status=status,
+                                color=0x1ABC9C,
+                                player_id=batter_id,
+                            )
+                        ],
+                    )
+                    sent_keys.add(key)
+
+        if isinstance(pitcher_id, int) and pitcher_id in watchlist:
+            wp = watchlist[pitcher_id]
+            if wp.role in {"pitcher", "both"} and event_type in NOTABLE_PITCHER_EVENTS:
+                key = f"{game_pk}:{at_bat_index}:pitcher:{pitcher_id}:{event_type}:{rbi}"
+                if key not in sent_keys:
+                    # Calculate SABR points for this pitcher event
+                    event_points = _event_sabr_points(event_type, is_batter=False)
+                    if pitcher_id not in running_points:
+                        running_points[pitcher_id] = 0.0
+                    running_points[pitcher_id] += event_points
+                    
+                    msg = result.get("description") or f"{wp.name}: {event_type}"
+                    sign = "+" if event_points >= 0 else ""
+                    points_str = f" | **{sign}{event_points:.1f} pts** (total: {running_points[pitcher_id]:.1f} pts)" if event_points != 0 else ""
+                    event_emoji = EVENT_EMOJIS.get(event_type, "⚾")
+                    send_webhook(
+                        webhook_url,
+                        f"{event_emoji} {game_text}: {wp.name} involved - {msg}{points_str}",
+                        dry_run=dry_run,
+                        embeds=[
+                            _discord_embed(
+                                title=f"{event_emoji} {wp.name} Pitching Alert",
+                                description=f"{event_emoji} {msg}{points_str}",
+                                away_abbr=away_abbr,
+                                home_abbr=home_abbr,
+                                status=status,
+                                color=0xE67E22,
+                                player_id=pitcher_id,
+                            )
+                        ],
+                    )
+                    sent_keys.add(key)
+
+    # Pitcher 3-inning milestone alerts (fires at 3, 6, 9 IP)
+    bs_teams = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    for side in ("home", "away"):
+        for key, pobj in bs_teams.get(side, {}).get("players", {}).items():
+            if not key.startswith("ID"):
+                continue
+            try:
+                pid = int(key[2:])
+            except ValueError:
+                continue
+            if pid not in watchlist:
+                continue
+            wp = watchlist[pid]
+            if wp.role not in {"pitcher", "both"}:
+                continue
+            pitching = pobj.get("stats", {}).get("pitching", {})
+            if not pitching:
+                continue
+            try:
+                ip_val = float(str(pitching.get("inningsPitched", "0.0")))
+            except ValueError:
+                ip_val = 0.0
+            api_obj = player_map.get(pid, {})
+            name = _display_name(api_obj, wp.name)
+            for milestone in (3, 6, 9):
+                if ip_val >= milestone:
+                    milestone_key = f"{game_pk}:pitcher_milestone:{pid}:ip{milestone}"
+                    if milestone_key not in sent_keys:
+                        ip_pts = milestone * SABR_PITCHING_POINTS["ip"]
+                        send_webhook(
+                            webhook_url,
+                            f"{EVENT_EMOJIS['milestone']} {game_text}: {name} has completed {milestone} innings | **+{ip_pts:.1f} IP pts**",
+                            dry_run=dry_run,
+                            embeds=[
+                                _discord_embed(
+                                    title=f"{name} Milestone",
+                                    description=f"Completed {milestone} innings (+{ip_pts:.1f} IP pts)",
+                                    away_abbr=away_abbr,
+                                    home_abbr=home_abbr,
+                                    status=status,
+                                    color=0x3498DB,
+                                    player_id=pid,
+                                )
+                            ],
+                        )
+                        sent_keys.add(milestone_key)
+
+    # --- Highlight clips (fires as clips become available, even mid-game) ---
+    seen_clips: set[str] = set(state.get("seen_clips", []))
+    for clip in _fetch_highlights(game_pk):
+        clip_id = clip["clip_id"]
+        if clip_id in seen_clips:
+            continue
+        matching_pids = [pid for pid in clip["player_ids"] if pid in watchlist]
+        if not matching_pids:
+            continue
+        send_webhook(
+            webhook_url,
+            f"{EVENT_EMOJIS['highlight']} {game_text}: {clip['headline']}",
+            dry_run=dry_run,
+        )
+        send_webhook(
+            webhook_url,
+            clip["mp4_url"],
+            dry_run=dry_run,
+        )
+        seen_clips.add(clip_id)
+
+    is_final = status.lower() == "final"
+    if is_final:
+        final_key = f"{game_pk}:final"
+        if final_key not in final_summaries:
+            for line, pid in _build_final_summary(game_text, feed, watchlist):
+                send_webhook(
+                    webhook_url,
+                    line,
+                    dry_run=dry_run,
+                    embeds=[
+                        _discord_embed(
+                            title="Final Statline",
+                            description=line,
+                            away_abbr=away_abbr,
+                            home_abbr=home_abbr,
+                            status=status,
+                            color=0x95A5A6,
+                            player_id=pid,
+                        )
+                    ],
+                )
+            final_summaries.add(final_key)
+
+    state["sent_keys"] = sorted(sent_keys)
+    state["announced_lineups"] = sorted(announced_lineups)
+    state["final_summaries"] = sorted(final_summaries)
+    state["seen_clips"] = sorted(seen_clips)
+
+    live_states = {"Live", "In Progress", "Manager Challenge", "Warmup"}
+    return status in live_states
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Ottoneu lineup Discord notifier")
+    parser.add_argument(
+        "--watchlist",
+        type=Path,
+        default=DEFAULT_WATCHLIST,
+        help="CSV file with player_name, mlbam_id, role",
+    )
+    parser.add_argument(
+        "--leaderboard-csv",
+        type=Path,
+        default=Path(os.getenv("FANGRAPHS_LEADERBOARD_CSV", "")).expanduser()
+        if os.getenv("FANGRAPHS_LEADERBOARD_CSV", "").strip()
+        else None,
+        help="Optional FanGraphs leaderboard CSV with Name and MLBAMID columns",
+    )
+    parser.add_argument(
+        "--bridge-csv",
+        type=Path,
+        default=Path(os.getenv("OTTONEU_BRIDGE_CSV", "")).expanduser()
+        if os.getenv("OTTONEU_BRIDGE_CSV", "").strip()
+        else None,
+        help="master_bridge.csv with Fantasy (playercard?id=X) and MLBAMID columns",
+    )
+    parser.add_argument(
+        "--ottoneu-html-file",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="PATH",
+        help="Path to a locally saved Ottoneu game HTML file (repeatable). "
+             "Use with --bridge-csv to build watchlist without scraping.",
+    )
+    parser.add_argument(
+        "--discord-html-channel-id",
+        type=str,
+        default=os.getenv("DISCORD_HTML_CHANNEL_ID", ""),
+        help="Discord channel ID to read uploaded Ottoneu HTML attachments from",
+    )
+    parser.add_argument(
+        "--discord-bot-token",
+        type=str,
+        default=os.getenv("DISCORD_BOT_TOKEN", ""),
+        help="Discord bot token used to read HTML attachments from a channel",
+    )
+    parser.add_argument(
+        "--discord-html-limit",
+        type=int,
+        default=int(os.getenv("DISCORD_HTML_LIMIT", "10")),
+        help="How many recent Discord messages to scan for HTML attachments",
+    )
+    parser.add_argument(
+        "--no-csv-watchlist",
+        action="store_true",
+        help="Ignore local watchlist CSV and use Ottoneu game URLs only",
+    )
+    parser.add_argument(
+        "--ottoneu-game-url",
+        action="append",
+        default=[],
+        help="Ottoneu matchup URL to scrape players from (repeatable)",
+    )
+    parser.add_argument(
+        "--ottoneu-role",
+        type=str,
+        default="both",
+        choices=["hitter", "pitcher", "both"],
+        help="Role assigned to players scraped from Ottoneu game URLs",
+    )
+    parser.add_argument(
+        "--ottoneu-cookie-header",
+        type=str,
+        default=os.getenv("OTTONEU_COOKIE_HEADER", ""),
+        help="Cookie header from logged-in Ottoneu browser session",
+    )
+    parser.add_argument(
+        "--ottoneu-fetch-mode",
+        type=str,
+        default=os.getenv("OTTONEU_FETCH_MODE", "auto"),
+        choices=["auto", "http", "playwright"],
+        help="How to fetch Ottoneu pages (auto/http/playwright)",
+    )
+    parser.add_argument(
+        "--ottoneu-debug-dir",
+        type=Path,
+        default=Path(os.getenv("OTTONEU_DEBUG_DIR", "")).expanduser()
+        if os.getenv("OTTONEU_DEBUG_DIR", "").strip()
+        else None,
+        help="Optional folder to dump fetched Ottoneu HTML pages for debugging",
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        default=os.getenv("NOTIFIER_DATE", date.today().isoformat()),
+        help="Target date in YYYY-MM-DD",
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=int,
+        default=int(os.getenv("NOTIFIER_POLL_SECONDS", "90")),
+        help="Polling interval while games are live",
+    )
+    parser.add_argument(
+        "--pregame-seconds",
+        type=int,
+        default=int(os.getenv("NOTIFIER_PREGAME_SECONDS", "300")),
+        help="Polling interval before tracked games go live",
+    )
+    parser.add_argument(
+        "--idle-seconds",
+        type=int,
+        default=int(os.getenv("NOTIFIER_IDLE_SECONDS", str(DEFAULT_IDLE_SECONDS))),
+        help="Polling interval when no tracked games are near/live",
+    )
+    parser.add_argument(
+        "--watchlist-refresh-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                "NOTIFIER_WATCHLIST_REFRESH_SECONDS",
+                str(DEFAULT_WATCHLIST_REFRESH_SECONDS),
+            )
+        ),
+        help="How often to check Discord for a newer lineup upload",
+    )
+    parser.add_argument(
+        "--postfinal-poll-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                "NOTIFIER_POSTFINAL_POLL_SECONDS",
+                str(DEFAULT_POSTFINAL_POLL_SECONDS),
+            )
+        ),
+        help="Polling interval while checking for late highlight clips after final",
+    )
+    parser.add_argument(
+        "--postfinal-highlight-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                "NOTIFIER_POSTFINAL_HIGHLIGHT_SECONDS",
+                str(DEFAULT_POSTFINAL_HIGHLIGHT_SECONDS),
+            )
+        ),
+        help="How long to keep checking for late highlight clips after a tracked game goes final",
+    )
+    parser.add_argument(
+        "--replay-final-games",
+        action="store_true",
+        help="Process tracked games even if they are already final, useful for testing past dates",
+    )
+    parser.add_argument(
+        "--state-file",
+        type=Path,
+        default=STATE_PATH,
+        help="State JSON path used for dedupe tracking",
+    )
+    parser.add_argument(
+        "--game-pk",
+        action="append",
+        type=int,
+        default=[],
+        help="Only process the specified MLB gamePk value(s)",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one pass and exit",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print notifications instead of posting to Discord",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if not webhook_url and not args.dry_run:
+        raise ValueError("Set DISCORD_WEBHOOK_URL env var or run with --dry-run")
+
+    date_is_fixed = "--date" in sys.argv or bool(os.getenv("NOTIFIER_DATE", "").strip())
+    fixed_target_date: date | None = None
+    if date_is_fixed:
+        try:
+            fixed_target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("--date must be YYYY-MM-DD") from exc
+
+    state = load_state(args.state_file)
+
+    leaderboard_name_map = None
+    if args.leaderboard_csv is not None:
+        leaderboard_name_map = load_leaderboard_name_map(args.leaderboard_csv)
+
+    bridge_id_map: dict[int, int] = {}
+    if args.bridge_csv is not None:
+        bridge_id_map = load_bridge_id_map(args.bridge_csv)
+
+    base_watchlist: dict[int, WatchPlayer] = {}
+    if not args.no_csv_watchlist and args.watchlist.exists():
+        base_watchlist.update(load_watchlist(args.watchlist))
+
+    if args.ottoneu_html_file:
+        if not bridge_id_map:
+            raise ValueError(
+                "--ottoneu-html-file requires --bridge-csv (or OTTONEU_BRIDGE_CSV env var)"
+            )
+        from_html = load_watchlist_from_html_files(
+            html_paths=args.ottoneu_html_file,
+            bridge_id_map=bridge_id_map,
+            role=args.ottoneu_role,
+        )
+        base_watchlist.update(from_html)
+
+    discord_watchlist: dict[int, WatchPlayer] = {}
+    if args.discord_html_channel_id:
+        if not bridge_id_map:
+            raise ValueError(
+                "--discord-html-channel-id requires --bridge-csv (or OTTONEU_BRIDGE_CSV env var)"
+            )
+        discord_watchlist = _deserialize_watchlist(
+            state.get("discord_watchlist_cache", {}).get("players")
+        )
+        if discord_watchlist:
+            print(f"Loaded cached Discord watchlist with {len(discord_watchlist)} players")
+        discord_watchlist, _ = refresh_discord_watchlist_cache(
+            state=state,
+            channel_id=args.discord_html_channel_id,
+            bot_token=args.discord_bot_token,
+            bridge_id_map=bridge_id_map,
+            role=args.ottoneu_role,
+            limit=max(1, args.discord_html_limit),
+        )
+
+    if args.ottoneu_game_url:
+        scraped = load_watchlist_from_ottoneu_games(
+            game_urls=args.ottoneu_game_url,
+            role=args.ottoneu_role,
+            cookie_header=args.ottoneu_cookie_header,
+            fetch_mode=args.ottoneu_fetch_mode,
+            debug_dir=args.ottoneu_debug_dir,
+            leaderboard_name_map=leaderboard_name_map,
+        )
+        base_watchlist.update(scraped)
+
+    watchlist = dict(base_watchlist)
+    watchlist.update(discord_watchlist)
+
+    if not watchlist:
+        raise ValueError(
+            "No players loaded. Provide a watchlist CSV, --ottoneu-html-file, --discord-html-channel-id, or --ottoneu-game-url."
+        )
+
+    team_ids = watched_team_ids(watchlist)
+    if not team_ids:
+        raise RuntimeError(
+            "Could not resolve watched players to MLB teams. Check mlbam_id values."
+        )
+
+    initial_target_date = fixed_target_date or date.today()
+    _roll_state_for_date(state, initial_target_date)
+    print(f"Watching {len(watchlist)} players for {initial_target_date.isoformat()}")
+    print(f"Resolved {len(team_ids)} tracked MLB teams")
+    print(f"Live poll interval: {args.poll_seconds}s")
+    print(f"Pregame poll interval: {args.pregame_seconds}s")
+    print(f"Idle poll interval: {args.idle_seconds}s")
+    print(f"Watchlist refresh interval: {args.watchlist_refresh_seconds}s")
+    print(f"Post-final highlight grace: {args.postfinal_highlight_seconds}s")
+
+    next_watchlist_refresh_at = 0.0
+
+    while True:
+        target_date = fixed_target_date or date.today()
+        _roll_state_for_date(state, target_date)
+
+        now_ts = time.time()
+        if args.discord_html_channel_id and now_ts >= next_watchlist_refresh_at:
+            next_watchlist_refresh_at = now_ts + max(30, args.watchlist_refresh_seconds)
+            try:
+                refreshed_discord_watchlist, changed = refresh_discord_watchlist_cache(
+                    state=state,
+                    channel_id=args.discord_html_channel_id,
+                    bot_token=args.discord_bot_token,
+                    bridge_id_map=bridge_id_map,
+                    role=args.ottoneu_role,
+                    limit=max(1, args.discord_html_limit),
+                )
+            except (HTTPError, URLError, TimeoutError) as exc:
+                print(f"Discord watchlist refresh failed: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"Discord watchlist refresh error: {exc}")
+            else:
+                if changed:
+                    discord_watchlist = refreshed_discord_watchlist
+                    watchlist = dict(base_watchlist)
+                    watchlist.update(discord_watchlist)
+                    team_ids = watched_team_ids(watchlist)
+                    state["announced_lineups"] = []
+                    print(
+                        f"Activated new Discord upload watchlist with {len(discord_watchlist)} players"
+                    )
+
+        try:
+            all_games = game_schedule(target_date)
+        except (HTTPError, URLError, TimeoutError) as exc:
+            print(f"Schedule fetch failed: {exc}")
+            if args.once:
+                return 1
+            time.sleep(args.idle_seconds)
+            continue
+
+        if not all_games:
+            print("No MLB games found for date.")
+            if args.once:
+                return 0
+            time.sleep(args.idle_seconds)
+            continue
+
+        games = tracked_games_for_watchlist(all_games, team_ids)
+        if args.game_pk:
+            allowed_game_pks = set(args.game_pk)
+            games = [game for game in games if int(game.get("gamePk")) in allowed_game_pks]
+        if not games:
+            print("No scheduled games for tracked players/teams on this date.")
+            if args.once:
+                return 0
+            save_state(args.state_file, state)
+            time.sleep(args.idle_seconds)
+            continue
+
+        live_game_pks: list[int] = []
+        pregame_game_pks: list[int] = []
+        final_grace_game_pks: list[int] = []
+        done_count = 0
+        final_game_times: dict[str, str] = state.setdefault("final_game_times", {})
+        now_utc = datetime.now(timezone.utc)
+        for game in games:
+            game_pk = int(game.get("gamePk"))
+            bucket = game_status_bucket(game)
+            if bucket == "live":
+                live_game_pks.append(game_pk)
+                final_game_times.pop(str(game_pk), None)
+            elif bucket == "pregame":
+                pregame_game_pks.append(game_pk)
+                final_game_times.pop(str(game_pk), None)
+            elif bucket == "final":
+                stamp = final_game_times.get(str(game_pk))
+                if not stamp:
+                    stamp = now_utc.isoformat()
+                    final_game_times[str(game_pk)] = stamp
+                try:
+                    first_seen = datetime.fromisoformat(stamp)
+                except ValueError:
+                    first_seen = now_utc
+                    final_game_times[str(game_pk)] = first_seen.isoformat()
+                age_seconds = max(0.0, (now_utc - first_seen).total_seconds())
+                if age_seconds <= max(0, args.postfinal_highlight_seconds):
+                    final_grace_game_pks.append(game_pk)
+                else:
+                    done_count += 1
+            elif bucket == "postponed":
+                done_count += 1
+                final_game_times.pop(str(game_pk), None)
+            else:
+                final_game_times.pop(str(game_pk), None)
+
+        if done_count == len(games) and not live_game_pks and not pregame_game_pks and not final_grace_game_pks and not args.replay_final_games:
+            print("All tracked games are complete for the date. Waiting for the next schedule window.")
+            if args.once:
+                return 0
+            save_state(args.state_file, state)
+            time.sleep(args.idle_seconds)
+            continue
+
+        any_live = False
+        if live_game_pks:
+            pks_to_process = list(live_game_pks) + [pk for pk in final_grace_game_pks if pk not in live_game_pks]
+        elif pregame_game_pks:
+            pks_to_process = list(pregame_game_pks) + [pk for pk in final_grace_game_pks if pk not in pregame_game_pks]
+        elif final_grace_game_pks:
+            pks_to_process = list(final_grace_game_pks)
+        elif args.replay_final_games:
+            pks_to_process = [int(game.get("gamePk")) for game in games]
+        else:
+            pks_to_process = []
+
+        if live_game_pks:
+            print(f"Scanning {len(live_game_pks)} live tracked games...")
+        elif pregame_game_pks:
+            next_msg = []
+            for game in games:
+                if int(game.get("gamePk")) not in pregame_game_pks:
+                    continue
+                label = game_label_from_schedule(game)
+                game_dt = _to_utc(game.get("gameDate"))
+                if game_dt is not None:
+                    next_msg.append(f"{label} at {game_dt.strftime('%H:%M UTC')}")
+                else:
+                    next_msg.append(label)
+            if next_msg:
+                print("Tracked games not live yet: " + "; ".join(next_msg[:5]))
+        elif final_grace_game_pks:
+            print(
+                f"Checking {len(final_grace_game_pks)} final tracked game(s) for late highlight clips..."
+            )
+        elif args.replay_final_games:
+            print(f"Replaying {len(pks_to_process)} completed tracked games...")
+
+        for game_pk in pks_to_process:
+            try:
+                game_is_live = process_game(
+                    game_pk=game_pk,
+                    watchlist=watchlist,
+                    webhook_url=webhook_url,
+                    state=state,
+                    dry_run=args.dry_run,
+                )
+                any_live = any_live or game_is_live
+            except (HTTPError, URLError, TimeoutError) as exc:
+                print(f"Game {game_pk} fetch failed: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"Game {game_pk} processing error: {exc}")
+
+        save_state(args.state_file, state)
+
+        if args.once:
+            return 0
+
+        # Poll quickly only during live action; otherwise back off until the next useful window.
+        if any_live or live_game_pks:
+            time.sleep(args.poll_seconds)
+        elif final_grace_game_pks:
+            time.sleep(args.postfinal_poll_seconds)
+        elif pregame_game_pks:
+            time.sleep(args.pregame_seconds)
+        else:
+            time.sleep(args.idle_seconds)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

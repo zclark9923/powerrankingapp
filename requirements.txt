@@ -5,3 +5,5 @@ openpyxl==3.1.5
 gunicorn==23.0.0
 diskcache==5.6.3
 multiprocess==0.70.16
+openai>=2.0.0
+playwright>=1.45.0

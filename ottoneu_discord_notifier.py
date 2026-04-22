@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from html.parser import HTMLParser
@@ -987,6 +988,154 @@ def _build_tracked_games_summary(team_ids: set[int], target_date: date) -> str:
     )
 
 
+def _ascii_name_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    clean = re.sub(r"[^a-z0-9]+", " ", stripped.lower())
+    return " ".join(clean.split())
+
+
+def _find_player_boxscore_entry(
+    feed: dict[str, Any],
+    player_id: int,
+) -> dict[str, Any] | None:
+    teams = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    key = f"ID{player_id}"
+    for side in ("home", "away"):
+        players = teams.get(side, {}).get("players", {})
+        if key in players:
+            return players[key]
+    return None
+
+
+def _player_play_lines(feed: dict[str, Any], player_id: int) -> tuple[list[str], list[str], float, float]:
+    plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
+    batter_lines: list[str] = []
+    pitcher_lines: list[str] = []
+    batter_points = 0.0
+    pitcher_points = 0.0
+
+    for play in plays:
+        about = play.get("about", {})
+        matchup = play.get("matchup", {})
+        result = play.get("result", {})
+        inning = int(about.get("inning", 0) or 0)
+        half = str(about.get("halfInning", "")).strip().lower()
+        inning_label = f"{inning}{'T' if half == 'top' else 'B'}"
+        desc = str(result.get("description") or result.get("event") or "").strip()
+        if not desc:
+            continue
+        event_type = str(result.get("eventType", "")).lower().strip()
+        scoring = bool(about.get("isScoringPlay", False))
+
+        batter_id = matchup.get("batter", {}).get("id")
+        if batter_id == player_id:
+            pts = _event_sabr_points(event_type, is_batter=True)
+            batter_points += pts
+            if scoring or event_type in NOTABLE_BATTER_EVENTS:
+                batter_lines.append(f"{inning_label}: {desc} ({pts:+.1f} pts)")
+
+        pitcher_id = matchup.get("pitcher", {}).get("id")
+        if pitcher_id == player_id:
+            pts = _event_sabr_points(event_type, is_batter=False)
+            pitcher_points += pts
+            if scoring or event_type in NOTABLE_PITCHER_EVENTS:
+                pitcher_lines.append(f"{inning_label}: {desc} ({pts:+.1f} pts)")
+
+    return batter_lines, pitcher_lines, batter_points, pitcher_points
+
+
+def _build_player_day_report(target_date: date, requested_name: str) -> str:
+    target_key = _ascii_name_key(requested_name)
+    if not target_key:
+        return "Usage: !ot player Full Name"
+
+    try:
+        games = game_schedule(target_date)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not fetch schedule: {exc}"
+
+    exact_matches: list[tuple[int, str, int, dict[str, Any]]] = []
+    fuzzy_matches: list[tuple[int, str, int, dict[str, Any]]] = []
+
+    for game in games:
+        game_pk = int(game.get("gamePk", 0) or 0)
+        if game_pk <= 0:
+            continue
+        try:
+            feed = _http_json(LIVE_FEED_TEMPLATE.format(game_pk=game_pk))
+        except Exception:
+            continue
+        players = _safe_player_map(feed)
+        for pid, obj in players.items():
+            name = _display_name(obj, str(pid))
+            name_key = _ascii_name_key(name)
+            if not name_key:
+                continue
+            row = (pid, name, game_pk, feed)
+            if name_key == target_key:
+                exact_matches.append(row)
+            elif target_key in name_key or name_key in target_key:
+                fuzzy_matches.append(row)
+
+    matches = exact_matches or fuzzy_matches
+    if not matches:
+        return f"No player match found for '{requested_name}' on {target_date.isoformat()}."
+
+    if len(matches) > 1:
+        sample = []
+        for _, name, _, feed in matches[:5]:
+            sample.append(f"{name} ({_game_label(feed)})")
+        return (
+            f"Multiple matches for '{requested_name}'. Please be more specific.\n"
+            f"Examples: {'; '.join(sample)}"
+        )
+
+    player_id, player_name, _game_pk, feed = matches[0]
+    game_text = _game_label(feed)
+    status = _status_label(feed)
+    box_entry = _find_player_boxscore_entry(feed, player_id) or {}
+    batting = box_entry.get("stats", {}).get("batting", {})
+    pitching = box_entry.get("stats", {}).get("pitching", {})
+
+    batter_lines, pitcher_lines, batter_points, pitcher_points = _player_play_lines(feed, player_id)
+    lines: list[str] = [f"{player_name} - {game_text} ({status})"]
+
+    if batting:
+        ab = int(batting.get("atBats", 0) or 0)
+        h = int(batting.get("hits", 0) or 0)
+        r = int(batting.get("runs", 0) or 0)
+        rbi = int(batting.get("rbi", 0) or 0)
+        hr = int(batting.get("homeRuns", 0) or 0)
+        sb = int(batting.get("stolenBases", 0) or 0)
+        lines.append(
+            f"Batting: {h}-{ab}, R {r}, RBI {rbi}, HR {hr}, SB {sb} | event pts {batter_points:+.1f}"
+        )
+    if pitching:
+        ip = str(pitching.get("inningsPitched", "0.0"))
+        so = int(pitching.get("strikeOuts", 0) or 0)
+        bb = int(pitching.get("baseOnBalls", 0) or 0)
+        er = int(pitching.get("earnedRuns", 0) or 0)
+        h_allowed = int(pitching.get("hits", 0) or 0)
+        whip = pitching.get("whip", "-")
+        lines.append(
+            f"Pitching: {ip} IP, H {h_allowed}, K {so}, BB {bb}, ER {er}, WHIP {whip} | event pts {pitcher_points:+.1f}"
+        )
+
+    detail_lines: list[str] = []
+    if batter_lines:
+        detail_lines.extend(["Batter plays:"] + batter_lines[:8])
+    if pitcher_lines:
+        detail_lines.extend(["Pitcher plays:"] + pitcher_lines[:8])
+
+    if detail_lines:
+        lines.extend(detail_lines)
+    else:
+        lines.append("No notable play events logged yet for this player today.")
+
+    return "\n".join(lines)
+
+
 def process_discord_text_commands(
     *,
     state: dict[str, Any],
@@ -1033,7 +1182,8 @@ def process_discord_text_commands(
                 f"{prefix} status - notifier status\n"
                 f"{prefix} watchlist - preview tracked players\n"
                 f"{prefix} refresh - force Discord upload refresh\n"
-                f"{prefix} games - tracked games summary"
+                f"{prefix} games - tracked games summary\n"
+                f"{prefix} player Full Name - player day report"
             )
         elif command == "status":
             response = (
@@ -1076,6 +1226,9 @@ def process_discord_text_commands(
                             f"No newer upload found. Tracking {len(discord_watchlist)} Discord players "
                             f"and {len(watchlist)} total players."
                         )
+        elif command.startswith("player "):
+            requested_name = command_text.split(" ", 1)[1].strip()
+            response = _build_player_day_report(target_date, requested_name)
         else:
             response = f"Unknown command '{command_text}'. Try: {prefix} help"
 

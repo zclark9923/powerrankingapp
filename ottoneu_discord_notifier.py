@@ -1522,6 +1522,8 @@ def process_discord_text_commands(
                 response = "No Discord HTML upload channel configured on this notifier."
             else:
                 try:
+                    # Force-clear cache so we always get a fresh load on manual refresh
+                    state["discord_watchlist_cache"] = {}
                     refreshed_discord_watchlist, changed = refresh_discord_watchlist_cache(
                         state=state,
                         channel_id=args.discord_html_channel_id,
@@ -1540,12 +1542,12 @@ def process_discord_text_commands(
                         team_ids = watched_team_ids(watchlist)
                         state["announced_lineups"] = []
                         response = (
-                            f"Loaded new upload watchlist with {len(discord_watchlist)} players. "
+                            f"Loaded {len(discord_watchlist)} Discord players. "
                             f"Now tracking {len(watchlist)} total players."
                         )
                     else:
                         response = (
-                            f"No newer upload found. Tracking {len(discord_watchlist)} Discord players "
+                            f"No HTML uploads found in channel. Tracking {len(discord_watchlist)} Discord players "
                             f"and {len(watchlist)} total players."
                         )
         elif command.startswith("player "):
@@ -2459,7 +2461,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--discord-html-limit",
         type=int,
-        default=int(os.getenv("DISCORD_HTML_LIMIT", "10")),
+        default=int(os.getenv("DISCORD_HTML_LIMIT", "50")),
         help="How many recent Discord messages to scan for HTML attachments",
     )
     parser.add_argument(

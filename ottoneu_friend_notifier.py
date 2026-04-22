@@ -51,6 +51,7 @@ PEOPLE_SEARCH_TEMPLATE = (
 )
 STATE_PATH = Path(__file__).with_name("ottoneu_friend_notifier_state.json")
 DEFAULT_WATCHLIST = Path(__file__).with_name("ottoneu_lineup_watchlist.csv")
+NICKNAMES_PATH = Path(__file__).with_name("nicknames.csv")
 DISCORD_API = "https://discord.com/api/v10"
 DEFAULT_IDLE_SECONDS = 900
 DEFAULT_WATCHLIST_REFRESH_SECONDS = 600
@@ -637,6 +638,39 @@ def load_watchlist(path: Path) -> dict[int, WatchPlayer]:
     if not players:
         raise ValueError(f"No valid rows found in watchlist: {path}")
     return players
+
+
+def load_nicknames(path: Path = NICKNAMES_PATH) -> dict[int, str]:
+    """Load player nicknames from CSV. Returns {player_id: nickname}."""
+    if not path.exists():
+        return {}
+    nicknames: dict[int, str] = {}
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    player_id = int(row.get("player_id", "").strip())
+                    nickname = str(row.get("nickname", "")).strip()
+                    if nickname:
+                        nicknames[player_id] = nickname
+                except ValueError:
+                    continue
+    except Exception:  # noqa: BLE001
+        pass
+    return nicknames
+
+
+def save_nicknames(nicknames: dict[int, str], path: Path = NICKNAMES_PATH) -> None:
+    """Save player nicknames to CSV."""
+    try:
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["player_id", "nickname"])
+            writer.writeheader()
+            for player_id, nickname in sorted(nicknames.items()):
+                writer.writerow({"player_id": player_id, "nickname": nickname})
+    except Exception as exc:  # noqa: BLE001
+        print(f"Failed to save nicknames: {exc}")
 
 
 def load_bridge_id_map(path: Path) -> dict[int, int]:
@@ -1320,7 +1354,7 @@ def _pitcher_sabr_points_from_box(pitching: dict[str, Any]) -> float:
     )
 
 
-def _build_player_day_report(target_date: date, requested_name: str) -> str:
+def _build_player_day_report(target_date: date, requested_name: str, nicknames: dict[int, str] | None = None) -> str:
     target_key = _ascii_name_key(requested_name)
     if not target_key:
         return "Usage: !ot player Full Name"
@@ -1343,7 +1377,7 @@ def _build_player_day_report(target_date: date, requested_name: str) -> str:
             continue
         players = _safe_player_map(feed)
         for pid, obj in players.items():
-            name = _display_name(obj, str(pid))
+            name = _display_name(obj, str(pid), player_id=pid, nicknames=nicknames)
             name_key = _ascii_name_key(name)
             if not name_key:
                 continue
@@ -1428,10 +1462,13 @@ def process_discord_text_commands(
     discord_watchlist: dict[int, WatchPlayer],
     watchlist: dict[int, WatchPlayer],
     team_ids: set[int],
+    nicknames: dict[int, str] | None = None,
     messages: list[DiscordCommandMessage] | None = None,
-) -> tuple[dict[int, WatchPlayer], dict[int, WatchPlayer], set[int]]:
+) -> tuple[dict[int, WatchPlayer], dict[int, WatchPlayer], set[int], dict[int, str]]:
+    if nicknames is None:
+        nicknames = {}
     if not args.discord_command_channel_id.strip() or not args.discord_bot_token.strip():
-        return discord_watchlist, watchlist, team_ids
+        return discord_watchlist, watchlist, team_ids, nicknames
 
     handled_ids = list(state.get("handled_command_ids", []))
     handled_set = set(handled_ids)
@@ -1448,7 +1485,7 @@ def process_discord_text_commands(
             )
         except Exception as exc:  # noqa: BLE001
             print(f"Discord command poll failed: {exc}")
-            return discord_watchlist, watchlist, team_ids
+            return discord_watchlist, watchlist, team_ids, nicknames
 
     for message in command_messages:
         if message.message_id in handled_set:
@@ -1470,7 +1507,10 @@ def process_discord_text_commands(
                 f"{prefix} watchlist - preview tracked players\n"
                 f"{prefix} refresh - force Discord upload refresh\n"
                 f"{prefix} games - tracked games summary\n"
-                f"{prefix} player Full Name - player day report"
+                f"{prefix} player Full Name - player day report\n"
+                f"{prefix} setnickname Full Name - New Nickname - set player nickname\n"
+                f"{prefix} removenickname Full Name - remove player nickname\n"
+                f"{prefix} clearnicknames - remove all nicknames"
             )
         elif command == "status":
             response = (
@@ -1515,7 +1555,66 @@ def process_discord_text_commands(
                         )
         elif command.startswith("player "):
             requested_name = command_text.split(" ", 1)[1].strip()
-            response = _build_player_day_report(target_date, requested_name)
+            response = _build_player_day_report(target_date, requested_name, nicknames=nicknames)
+        elif command.startswith("setnickname "):
+            remainder = command_text.split(" ", 1)[1].strip()
+            if " - " not in remainder:
+                response = f"Usage: {prefix} setnickname Full Name - New Nickname"
+            else:
+                player_name, nickname = remainder.split(" - ", 1)
+                player_name = player_name.strip()
+                nickname = nickname.strip()
+                if not player_name or not nickname:
+                    response = f"Usage: {prefix} setnickname Full Name - New Nickname"
+                else:
+                    found_ids = []
+                    try:
+                        for pid, wp in watchlist.items():
+                            if _ascii_name_key(wp.name) == _ascii_name_key(player_name):
+                                found_ids.append(pid)
+                    except Exception:
+                        pass
+                    if len(found_ids) == 1:
+                        pid = found_ids[0]
+                        nicknames[pid] = nickname
+                        save_nicknames(nicknames)
+                        response = f"Nickname set: {watchlist[pid].name} -> {nickname}"
+                    elif len(found_ids) > 1:
+                        response = f"Multiple players match '{player_name}'. Be more specific."
+                    else:
+                        response = f"Player '{player_name}' not found in watchlist."
+        elif command.startswith("removenickname "):
+            remainder = command_text.split(" ", 1)[1].strip()
+            if not remainder:
+                response = f"Usage: {prefix} removenickname Full Name"
+            else:
+                found_ids = []
+                try:
+                    for pid, wp in watchlist.items():
+                        if _ascii_name_key(wp.name) == _ascii_name_key(remainder):
+                            found_ids.append(pid)
+                except Exception:
+                    pass
+                if len(found_ids) == 1:
+                    pid = found_ids[0]
+                    if pid in nicknames:
+                        del nicknames[pid]
+                        save_nicknames(nicknames)
+                        response = f"Nickname removed for {watchlist[pid].name}"
+                    else:
+                        response = f"{watchlist[pid].name} has no nickname set."
+                elif len(found_ids) > 1:
+                    response = f"Multiple players match '{remainder}'. Be more specific."
+                else:
+                    response = f"Player '{remainder}' not found in watchlist."
+        elif command == "clearnicknames":
+            if nicknames:
+                count = len(nicknames)
+                nicknames.clear()
+                save_nicknames(nicknames)
+                response = f"Cleared {count} nicknames."
+            else:
+                response = "No nicknames to clear."
         else:
             response = f"Unknown command '{command_text}'. Try: {prefix} help"
 
@@ -1545,7 +1644,7 @@ def process_discord_text_commands(
     if len(handled_ids) > 500:
         handled_ids = handled_ids[-500:]
     state["handled_command_ids"] = handled_ids
-    return discord_watchlist, watchlist, team_ids
+    return discord_watchlist, watchlist, team_ids, nicknames
 
 
 def game_schedule(target_date: date) -> list[dict[str, Any]]:
@@ -1625,13 +1724,38 @@ def _safe_player_map(feed: dict[str, Any]) -> dict[int, dict[str, Any]]:
     return out
 
 
-def _display_name(player_obj: dict[str, Any], fallback: str) -> str:
+def _display_name(player_obj: dict[str, Any], fallback: str, player_id: int | None = None, nicknames: dict[int, str] | None = None) -> str:
+    if nicknames and player_id in nicknames:
+        return nicknames[player_id]
     return (
         player_obj.get("name")
         or player_obj.get("fullName")
         or player_obj.get("lastFirstName")
         or fallback
     )
+
+
+def _notification_name(
+    player_obj: dict[str, Any],
+    fallback: str,
+    *,
+    player_id: int | None = None,
+    nicknames: dict[int, str] | None = None,
+) -> str:
+    original_name = (
+        player_obj.get("name")
+        or player_obj.get("fullName")
+        or player_obj.get("lastFirstName")
+        or fallback
+    )
+    if not nicknames or player_id not in nicknames:
+        return original_name
+    nickname = nicknames[player_id].strip()
+    if not nickname:
+        return original_name
+    if _ascii_name_key(nickname) == _ascii_name_key(original_name):
+        return original_name
+    return f"{nickname} ({original_name})"
 
 
 def _game_label(feed: dict[str, Any]) -> str:
@@ -1746,6 +1870,7 @@ def _build_final_summary(
     game_text: str,
     feed: dict[str, Any],
     watchlist: dict[int, WatchPlayer],
+    nicknames: dict[int, str] | None = None,
 ) -> list[tuple[str, int]]:
     """Build final game summary including SABR points for watched players."""
     lines: list[tuple[str, int]] = []
@@ -1764,7 +1889,7 @@ def _build_final_summary(
                 continue
 
             wp = watchlist[pid]
-            name = wp.name
+            name = _notification_name(pobj.get("person", {}), wp.name, player_id=pid, nicknames=nicknames)
             batting = pobj.get("stats", {}).get("batting", {})
             pitching = pobj.get("stats", {}).get("pitching", {})
 
@@ -1987,6 +2112,7 @@ def process_game(
     webhook_url: str,
     state: dict[str, Any],
     dry_run: bool,
+    nicknames: dict[int, str] | None = None,
 ) -> bool:
     feed = _http_json(LIVE_FEED_TEMPLATE.format(game_pk=game_pk))
     game_text = _game_label(feed)
@@ -2032,6 +2158,7 @@ def process_game(
 
         if isinstance(batter_id, int) and batter_id in watchlist:
             wp = watchlist[batter_id]
+            batter_name = _notification_name(player_map.get(batter_id, {}), wp.name, player_id=batter_id, nicknames=nicknames)
             is_notable_batter = (
                 event_type in NOTABLE_BATTER_EVENTS
                 or event_type.startswith("stolen_base")
@@ -2048,17 +2175,17 @@ def process_game(
                         running_points[batter_id] = 0.0
                     running_points[batter_id] += event_points
                     
-                    msg = result.get("description") or f"{wp.name}: {event_type}"
+                    msg = result.get("description") or f"{batter_name}: {event_type}"
                     sign = "+" if event_points >= 0 else ""
                     points_str = f" | **{sign}{event_points:.1f} pts** (total: {running_points[batter_id]:.1f} pts)" if event_points != 0 else ""
                     event_emoji = EVENT_EMOJIS.get(event_type, "⚾")
                     send_webhook(
                         webhook_url,
-                        f"{event_emoji} {game_text}: {wp.name} - {msg}{statcast_suffix}{points_str}",
+                        f"{event_emoji} {game_text}: {batter_name} - {msg}{statcast_suffix}{points_str}",
                         dry_run=dry_run,
                         embeds=[
                             _discord_embed(
-                                title=f"{wp.name} Alert - {event_name}",
+                                title=f"{batter_name} Alert - {event_name}",
                                 description=f"{event_emoji} {msg}{statcast_suffix}{points_str}",
                                 away_abbr=away_abbr,
                                 home_abbr=home_abbr,
@@ -2072,6 +2199,7 @@ def process_game(
 
         if isinstance(pitcher_id, int) and pitcher_id in watchlist:
             wp = watchlist[pitcher_id]
+            pitcher_name = _notification_name(player_map.get(pitcher_id, {}), wp.name, player_id=pitcher_id, nicknames=nicknames)
             if wp.role in {"pitcher", "both"} and event_type in NOTABLE_PITCHER_EVENTS:
                 key = f"{game_pk}:{at_bat_index}:pitcher:{pitcher_id}:{event_type}:{rbi}"
                 if key not in sent_keys:
@@ -2081,17 +2209,17 @@ def process_game(
                         running_points[pitcher_id] = 0.0
                     running_points[pitcher_id] += event_points
                     
-                    msg = result.get("description") or f"{wp.name}: {event_type}"
+                    msg = result.get("description") or f"{pitcher_name}: {event_type}"
                     sign = "+" if event_points >= 0 else ""
                     points_str = f" | **{sign}{event_points:.1f} pts** (total: {running_points[pitcher_id]:.1f} pts)" if event_points != 0 else ""
                     event_emoji = EVENT_EMOJIS.get(event_type, "⚾")
                     send_webhook(
                         webhook_url,
-                        f"{event_emoji} {game_text}: {wp.name} involved - {msg}{points_str}",
+                        f"{event_emoji} {game_text}: {pitcher_name} involved - {msg}{points_str}",
                         dry_run=dry_run,
                         embeds=[
                             _discord_embed(
-                                title=f"{event_emoji} {wp.name} Pitching Alert",
+                                title=f"{event_emoji} {pitcher_name} Pitching Alert",
                                 description=f"{event_emoji} {msg}{points_str}",
                                 away_abbr=away_abbr,
                                 home_abbr=home_abbr,
@@ -2163,7 +2291,7 @@ def process_game(
             )
             sign = "+" if outing_points >= 0 else ""
             api_obj = player_map.get(pid, {})
-            name = _display_name(api_obj, wp.name)
+            name = _notification_name(api_obj, wp.name, player_id=pid, nicknames=nicknames)
             summary = (
                 f"{name} finished: {ip} IP, {so} K, {bb} BB, {er} ER, WHIP {whip}"
                 f" | **{sign}{outing_points:.1f} pts**"
@@ -2208,7 +2336,7 @@ def process_game(
             except ValueError:
                 ip_val = 0.0
             api_obj = player_map.get(pid, {})
-            name = _display_name(api_obj, wp.name)
+            name = _notification_name(api_obj, wp.name, player_id=pid, nicknames=nicknames)
             for milestone in (3, 6, 9):
                 if ip_val >= milestone:
                     milestone_key = f"{game_pk}:pitcher_milestone:{pid}:ip{milestone}"
@@ -2260,7 +2388,7 @@ def process_game(
     if is_final:
         final_key = f"{game_pk}:final"
         if final_key not in final_summaries:
-            for line, pid in _build_final_summary(game_text, feed, watchlist):
+            for line, pid in _build_final_summary(game_text, feed, watchlist, nicknames=nicknames):
                 send_webhook(
                     webhook_url,
                     line,
@@ -2583,6 +2711,8 @@ def main() -> int:
     watchlist = dict(base_watchlist)
     watchlist.update(discord_watchlist)
 
+    nicknames = load_nicknames()
+
     if not watchlist:
         raise ValueError(
             "No players loaded. Provide a watchlist CSV, --ottoneu-html-file, --discord-html-channel-id, or --ottoneu-game-url."
@@ -2670,7 +2800,7 @@ def main() -> int:
         if command_push_listener:
             pushed_messages = command_push_listener.drain_messages()
             if pushed_messages:
-                discord_watchlist, watchlist, team_ids = process_discord_text_commands(
+                discord_watchlist, watchlist, team_ids, nicknames = process_discord_text_commands(
                     state=state,
                     args=args,
                     target_date=target_date,
@@ -2679,6 +2809,7 @@ def main() -> int:
                     discord_watchlist=discord_watchlist,
                     watchlist=watchlist,
                     team_ids=team_ids,
+                    nicknames=nicknames,
                     messages=pushed_messages,
                 )
 
@@ -2689,7 +2820,7 @@ def main() -> int:
         )
         if args.discord_command_channel_id and should_poll_commands and now_ts >= next_command_poll_at:
             next_command_poll_at = now_ts + _effective_command_poll_seconds(args)
-            discord_watchlist, watchlist, team_ids = process_discord_text_commands(
+            discord_watchlist, watchlist, team_ids, nicknames = process_discord_text_commands(
                 state=state,
                 args=args,
                 target_date=target_date,
@@ -2698,6 +2829,7 @@ def main() -> int:
                 discord_watchlist=discord_watchlist,
                 watchlist=watchlist,
                 team_ids=team_ids,
+                nicknames=nicknames,
             )
 
         try:
@@ -2814,6 +2946,7 @@ def main() -> int:
                     webhook_url=webhook_url,
                     state=state,
                     dry_run=args.dry_run,
+                    nicknames=nicknames,
                 )
                 any_live = any_live or game_is_live
             except (HTTPError, URLError, TimeoutError) as exc:
@@ -2848,12 +2981,13 @@ def main() -> int:
                 if command_push_listener:
                     pushed_messages = command_push_listener.drain_messages()
                     if pushed_messages:
-                        discord_watchlist, watchlist, team_ids = process_discord_text_commands(
+                        discord_watchlist, watchlist, team_ids, nicknames = process_discord_text_commands(
                             state=state,
                             args=args,
                             target_date=target_date,
                             bridge_id_map=bridge_id_map,
                             base_watchlist=base_watchlist,
+                            nicknames=nicknames,
                             discord_watchlist=discord_watchlist,
                             watchlist=watchlist,
                             team_ids=team_ids,
@@ -2867,12 +3001,13 @@ def main() -> int:
                 )
                 if should_poll_commands and now_ts >= next_command_poll_at:
                     next_command_poll_at = now_ts + _effective_command_poll_seconds(args)
-                    discord_watchlist, watchlist, team_ids = process_discord_text_commands(
+                    discord_watchlist, watchlist, team_ids, nicknames = process_discord_text_commands(
                         state=state,
                         args=args,
                         target_date=target_date,
                         bridge_id_map=bridge_id_map,
                         base_watchlist=base_watchlist,
+                        nicknames=nicknames,
                         discord_watchlist=discord_watchlist,
                         watchlist=watchlist,
                         team_ids=team_ids,

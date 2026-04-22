@@ -1797,6 +1797,13 @@ def _team_logo_url(team_abbr: str) -> str:
     return f"https://a.espncdn.com/i/teamlogos/mlb/500/{team_abbr.lower()}.png"
 
 
+def _player_headshot_url(player_id: int) -> str:
+    return (
+        "https://img.mlbstatic.com/mlb-photos/image/upload/"
+        f"w_213,q_auto:best/v1/people/{player_id}/headshot/67/current"
+    )
+
+
 def _discord_embed(
     title: str,
     description: str,
@@ -1818,9 +1825,11 @@ def _discord_embed(
         },
         "footer": {
             "text": status,
+            "icon_url": home_logo,
         },
-        "thumbnail": {"url": home_logo},
     }
+    if player_id is not None:
+        embed["thumbnail"] = {"url": _player_headshot_url(player_id)}
     return embed
 
 
@@ -2313,13 +2322,6 @@ def process_game(
             # But NOT if the pitcher is still actively pitching (current) and game isn't over
             if not is_final and current_pitcher_id == pid:
                 continue
-            # Also don't announce if the pitcher is still in the game's active pitcher list and game isn't final
-            # (this means they haven't actually been replaced yet)
-            if not is_final:
-                pitcher_ids = bs_teams.get(side, {}).get("pitchers", [])
-                if isinstance(pitcher_ids, list) and pid in pitcher_ids:
-                    # Pitcher is still in the game's pitcher list and game isn't final, so outing isn't complete
-                    continue
 
             so = int(pitching.get("strikeOuts", 0) or 0)
             bb = int(pitching.get("baseOnBalls", 0) or 0)

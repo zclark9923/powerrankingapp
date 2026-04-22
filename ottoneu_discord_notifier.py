@@ -694,11 +694,28 @@ def load_bridge_id_map(path: Path) -> dict[int, int]:
 
 
 def parse_ottoneu_player_ids(page_html: str) -> set[int]:
-    """Extract Ottoneu player IDs from /players/{id} links in game HTML."""
-    return {
+    """Extract starter-only Ottoneu player IDs from a saved matchup page.
+
+    Includes rows marked as starters and excludes any player whose position cell is
+    Bench or Minors.
+    """
+    starter_ids = {
         int(m.group(1))
-        for m in re.finditer(r'/players/(\d+)', page_html)
+        for m in re.finditer(
+            r'<tr[^>]*\bclass="[^"]*\bstarter\b[^"]*"[^>]*\bid="player_row_(\d+)"',
+            page_html,
+            flags=re.IGNORECASE,
+        )
     }
+    excluded_ids = {
+        int(m.group(1))
+        for m in re.finditer(
+            r'<td[^>]*\bid="position_(\d+)"[^>]*>\s*(Bench|Minors)\s*</td>',
+            page_html,
+            flags=re.IGNORECASE,
+        )
+    }
+    return starter_ids - excluded_ids
 
 
 def load_leaderboard_name_map(path: Path) -> dict[str, int]:

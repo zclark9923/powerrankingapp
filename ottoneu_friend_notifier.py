@@ -1941,6 +1941,21 @@ def _starting_pitcher_ids(feed: dict[str, Any]) -> set[int]:
     return ids
 
 
+def _defensive_side_from_linescore(feed: dict[str, Any]) -> str | None:
+    """Return which side is currently pitching: 'home', 'away', or None."""
+    linescore = feed.get("liveData", {}).get("linescore", {})
+    is_top = linescore.get("isTopInning")
+    if isinstance(is_top, bool):
+        return "home" if is_top else "away"
+
+    inning_state = str(linescore.get("inningState", "")).lower()
+    if inning_state.startswith("top"):
+        return "home"
+    if inning_state.startswith("bottom"):
+        return "away"
+    return None
+
+
 def _build_final_summary(
     game_text: str,
     feed: dict[str, Any],
@@ -2362,6 +2377,7 @@ def process_game(
     # Pitcher outing-complete alerts (helps surface reliever appearances).
     bs_teams = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
     is_final = status.lower() == "final"
+    defensive_side = _defensive_side_from_linescore(feed)
     for side in ("home", "away"):
         for key, pobj in bs_teams.get(side, {}).get("players", {}).items():
             if not key.startswith("ID"):
@@ -2386,10 +2402,13 @@ def process_game(
             outing_key = f"{game_pk}:pitcher_outing:{pid}"
             if outing_key in sent_keys:
                 continue
-            # Only announce outing complete if: (1) game is final, OR (2) a different pitcher is currently on mound
-            # But NOT if the pitcher is still actively pitching (current) and game isn't over
-            if not is_final and current_pitcher_id == pid:
-                continue
+            # Mid-game, only announce outing complete once this pitcher's team is back on
+            # defense and a different current pitcher is confirmed for that side.
+            if not is_final:
+                if defensive_side != side:
+                    continue
+                if current_pitcher_id is None or current_pitcher_id == pid:
+                    continue
 
             so = int(pitching.get("strikeOuts", 0) or 0)
             bb = int(pitching.get("baseOnBalls", 0) or 0)

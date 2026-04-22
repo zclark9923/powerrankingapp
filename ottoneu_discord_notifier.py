@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import os
+import plistlib
 import re
 import sys
 import threading
@@ -793,9 +794,8 @@ def resolve_name_to_mlbam_id(
         if mapped is not None:
             return mapped
 
-    cached = _NAME_RESOLVE_CACHE.get(name)
     if name in _NAME_RESOLVE_CACHE:
-        return cached
+        return _NAME_RESOLVE_CACHE[name]
 
     url = PEOPLE_SEARCH_TEMPLATE.format(name=quote_plus(name))
     try:
@@ -877,7 +877,6 @@ def load_watchlist_from_html_files(
 
 def _extract_html_from_webarchive(webarchive_data: bytes) -> str | None:
     """Attempt to extract HTML content from a macOS Safari .webarchive file (plist format)."""
-    import plistlib
     try:
         plist = plistlib.loads(webarchive_data)
         main_resource = plist.get("WebMainResource", {})
@@ -917,19 +916,17 @@ def fetch_discord_html_attachments(
             continue
         for attachment in attachments:
             filename = str(attachment.get("filename", "")).strip()
-            url = str(attachment.get("url", "")).strip()
+            attachment_url = str(attachment.get("url", "")).strip()
             content_type = str(attachment.get("content_type", "")).strip().lower()
-            if not filename or not url or url in seen_urls:
+            if not filename or not attachment_url or attachment_url in seen_urls:
                 continue
-            lower_name = filename.lower()
-            is_supported_page = lower_name.endswith((".html", ".htm", ".mht", ".mhtml", ".webarchive"))
-            if not is_supported_page and "text/html" not in content_type and "message/rfc822" not in content_type:
+            if not _discord_attachment_supported(filename, content_type):
                 continue
-            
+
             # Download file content (text for HTML, binary for webarchive)
-            if lower_name.endswith(".webarchive"):
+            if filename.lower().endswith(".webarchive"):
                 try:
-                    req = Request(url, headers={"User-Agent": "ottoneu-discord-notifier/1.0"})
+                    req = Request(attachment_url, headers={"User-Agent": "ottoneu-discord-notifier/1.0"})
                     with urlopen(req, timeout=20) as resp:
                         webarchive_bytes = resp.read()
                     extracted_html = _extract_html_from_webarchive(webarchive_bytes)
@@ -938,10 +935,8 @@ def fetch_discord_html_attachments(
                 except Exception as exc:
                     print(f"Warning: Failed to extract HTML from {filename}: {exc}")
             else:
-                html_files.append((filename, _http_text(url)))
-            seen_urls.add(url)
-
-    return html_files
+                html_files.append((filename, _http_text(attachment_url)))
+            seen_urls.add(attachment_url)
 
 
 def load_watchlist_from_discord_html_attachments(
@@ -1983,33 +1978,8 @@ def _build_final_summary(
             batting = pobj.get("stats", {}).get("batting", {})
             pitching = pobj.get("stats", {}).get("pitching", {})
 
-            batting_points = 0.0
-            if batting:
-                ab = int(batting.get("atBats", 0) or 0)
-                hits = int(batting.get("hits", 0) or 0)
-                doubles = int(batting.get("doubles", 0) or 0)
-                triples = int(batting.get("triples", 0) or 0)
-                hrs = int(batting.get("homeRuns", 0) or 0)
-                bb = int(batting.get("baseOnBalls", 0) or 0)
-                hbp = int(batting.get("hitByPitch", 0) or 0)
-                sb = int(batting.get("stolenBases", 0) or 0)
-                cs = int(batting.get("caughtStealing", 0) or 0)
-
-                batting_points = (
-                    ab * SABR_HITTING_POINTS["at_bat"]
-                    + hits * SABR_HITTING_POINTS["hit"]
-                    + doubles * SABR_HITTING_POINTS["double"]
-                    + triples * SABR_HITTING_POINTS["triple"]
-                    + hrs * SABR_HITTING_POINTS["home_run"]
-                    + bb * SABR_HITTING_POINTS["walk"]
-                    + hbp * SABR_HITTING_POINTS["hbp"]
-                    + sb * SABR_HITTING_POINTS["stolen_base"]
-                    + cs * SABR_HITTING_POINTS["caught_stealing"]
-                )
-
-            pitching_points = 0.0
-            if pitching:
-                pitching_points = _pitcher_sabr_points_from_box(pitching)
+            batting_points = _batter_sabr_points_from_box(batting) if batting else 0.0
+            pitching_points = _pitcher_sabr_points_from_box(pitching) if pitching else 0.0
 
             if batting:
                 ab = int(batting.get("atBats", 0) or 0)
@@ -2233,7 +2203,7 @@ def _innings_pitched_to_outs(ip_value: str) -> int:
     try:
         whole_str, frac_str = str(ip_value).split(".", 1)
         whole = int(whole_str)
-        frac = int(frac_str)
+        frac = int(frac_str[:1] or "0")
     except (ValueError, TypeError):
         return 0
     if frac not in {0, 1, 2}:

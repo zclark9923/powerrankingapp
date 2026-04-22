@@ -57,6 +57,7 @@ DEFAULT_WATCHLIST_REFRESH_SECONDS = 600
 DEFAULT_POSTFINAL_POLL_SECONDS = 300
 DEFAULT_POSTFINAL_HIGHLIGHT_SECONDS = 1800
 DISCORD_GATEWAY_INTENT_GUILD_MESSAGES = 1 << 9
+DISCORD_GATEWAY_INTENT_MESSAGE_CONTENT = 1 << 15
 
 EVENT_EMOJIS = {
     "lineup": "🧢",
@@ -490,7 +491,10 @@ class DiscordGatewayCommandListener:
                                 "op": 2,
                                 "d": {
                                     "token": self.bot_token,
-                                    "intents": DISCORD_GATEWAY_INTENT_GUILD_MESSAGES,
+                                    "intents": (
+                                        DISCORD_GATEWAY_INTENT_GUILD_MESSAGES
+                                        | DISCORD_GATEWAY_INTENT_MESSAGE_CONTENT
+                                    ),
                                     "properties": {
                                         "os": "linux",
                                         "browser": "ottoneu-notifier",
@@ -2592,7 +2596,11 @@ def main() -> int:
                     messages=pushed_messages,
                 )
 
-        should_poll_commands = args.discord_command_mode == "poll" or not push_ready
+        should_poll_commands = (
+            args.discord_command_mode == "poll"
+            or not push_ready
+            or (args.discord_command_mode == "push" and args.discord_command_poll_seconds > 0)
+        )
         if args.discord_command_channel_id and should_poll_commands and now_ts >= next_command_poll_at:
             next_command_poll_at = now_ts + max(5, args.discord_command_poll_seconds)
             discord_watchlist, watchlist, team_ids = process_discord_text_commands(
@@ -2766,7 +2774,11 @@ def main() -> int:
                             messages=pushed_messages,
                         )
 
-                should_poll_commands = args.discord_command_mode == "poll" or not push_ready
+                should_poll_commands = (
+                    args.discord_command_mode == "poll"
+                    or not push_ready
+                    or (args.discord_command_mode == "push" and args.discord_command_poll_seconds > 0)
+                )
                 if should_poll_commands and now_ts >= next_command_poll_at:
                     next_command_poll_at = now_ts + max(5, args.discord_command_poll_seconds)
                     discord_watchlist, watchlist, team_ids = process_discord_text_commands(

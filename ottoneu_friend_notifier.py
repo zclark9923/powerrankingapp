@@ -2455,13 +2455,36 @@ def main() -> int:
 
         # Poll quickly only during live action; otherwise back off until the next useful window.
         if any_live or live_game_pks:
-            time.sleep(args.poll_seconds)
+            sleep_seconds = args.poll_seconds
         elif final_grace_game_pks:
-            time.sleep(args.postfinal_poll_seconds)
+            sleep_seconds = args.postfinal_poll_seconds
         elif pregame_game_pks:
-            time.sleep(args.pregame_seconds)
+            sleep_seconds = args.pregame_seconds
         else:
-            time.sleep(args.idle_seconds)
+            sleep_seconds = args.idle_seconds
+
+        # Keep command responsiveness high by polling commands during sleep windows.
+        if args.discord_command_channel_id.strip() and args.discord_bot_token.strip():
+            remaining = max(0, int(sleep_seconds))
+            while remaining > 0:
+                step = min(5, remaining)
+                time.sleep(step)
+                remaining -= step
+                now_ts = time.time()
+                if now_ts >= next_command_poll_at:
+                    next_command_poll_at = now_ts + max(10, args.discord_command_poll_seconds)
+                    discord_watchlist, watchlist, team_ids = process_discord_text_commands(
+                        state=state,
+                        args=args,
+                        target_date=target_date,
+                        bridge_id_map=bridge_id_map,
+                        base_watchlist=base_watchlist,
+                        discord_watchlist=discord_watchlist,
+                        watchlist=watchlist,
+                        team_ids=team_ids,
+                    )
+        else:
+            time.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":

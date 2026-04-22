@@ -1273,6 +1273,7 @@ def _player_play_lines(
     *,
     include_all_batter_events: bool = False,
     include_statcast: bool = False,
+    pitcher_event_filter: set[str] | None = None,
 ) -> tuple[list[str], list[str], float, float]:
     plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
     batter_lines: list[str] = []
@@ -1307,7 +1308,12 @@ def _player_play_lines(
         if pitcher_id == player_id:
             pts = _event_sabr_points(event_type, is_batter=False)
             pitcher_points += pts
-            if scoring or event_type in NOTABLE_PITCHER_EVENTS:
+            include_pitcher_play = (
+                scoring or event_type in NOTABLE_PITCHER_EVENTS
+                if pitcher_event_filter is None
+                else event_type in pitcher_event_filter
+            )
+            if include_pitcher_play:
                 pitcher_lines.append(f"{inning_label}: {desc} ({pts:+.1f} pts)")
 
     return batter_lines, pitcher_lines, batter_points, pitcher_points
@@ -1453,6 +1459,7 @@ def _build_player_day_report(target_date: date, requested_name: str, nicknames: 
         player_id,
         include_all_batter_events=True,
         include_statcast=True,
+        pitcher_event_filter={"strikeout", "walk", "intent_walk", "hit_by_pitch", "home_run"},
     )
     lines: list[str] = [f"{player_name} - {game_text} ({status})"]
 

@@ -167,6 +167,13 @@ class DiscordHtmlAttachment:
     url: str
 
 
+@dataclass(frozen=True)
+class DiscordCommandMessage:
+    message_id: str
+    author_id: str
+    content: str
+
+
 class _AnchorCollector(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -301,19 +308,85 @@ def fetch_ottoneu_page_html(url: str, cookie_header: str, fetch_mode: str) -> st
     return html
 
 
-def _http_post_json(url: str, payload: dict[str, Any], timeout: int = 20) -> int:
+def _http_post_json(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    timeout: int = 20,
+) -> int:
     data = json.dumps(payload).encode("utf-8")
+    req_headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "ottoneu-discord-notifier/1.0",
+    }
+    if headers:
+        req_headers.update(headers)
     req = Request(
         url,
         data=data,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "ottoneu-discord-notifier/1.0",
-        },
+        headers=req_headers,
         method="POST",
     )
     with urlopen(req, timeout=timeout) as resp:
         return int(getattr(resp, "status", 200))
+
+
+def fetch_discord_command_messages(
+    channel_id: str,
+    bot_token: str,
+    limit: int = 20,
+) -> list[DiscordCommandMessage]:
+    if not channel_id.strip() or not bot_token.strip():
+        return []
+    url = f"{DISCORD_API}/channels/{channel_id}/messages?limit={max(1, limit)}"
+    headers = {"Authorization": f"Bot {bot_token.strip()}"}
+    payload = _http_json(url, headers=headers)
+    if not isinstance(payload, list):
+        return []
+
+    messages: list[DiscordCommandMessage] = []
+    for message in reversed(payload):
+        message_id = str(message.get("id", "")).strip()
+        author = message.get("author", {})
+        author_id = str(author.get("id", "")).strip()
+        if not message_id or not author_id:
+            continue
+        if bool(author.get("bot", False)):
+            continue
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+        messages.append(
+            DiscordCommandMessage(
+                message_id=message_id,
+                author_id=author_id,
+                content=content,
+            )
+        )
+    return messages
+
+
+def send_discord_channel_message(
+    channel_id: str,
+    bot_token: str,
+    message: str,
+    reply_to_message_id: str | None = None,
+) -> None:
+    if not channel_id.strip() or not bot_token.strip():
+        return
+    text = message.strip()
+    if not text:
+        return
+    payload: dict[str, Any] = {"content": text[:1900]}
+    if reply_to_message_id:
+        payload["message_reference"] = {"message_id": reply_to_message_id}
+    status = _http_post_json(
+        f"{DISCORD_API}/channels/{channel_id}/messages",
+        payload,
+        headers={"Authorization": f"Bot {bot_token.strip()}"},
+    )
+    if status not in (200, 201):
+        raise RuntimeError(f"Discord channel send failed with status {status}")
 
 
 def load_watchlist(path: Path) -> dict[int, WatchPlayer]:
@@ -697,6 +770,7 @@ def load_state(path: Path) -> dict[str, Any]:
         "seen_clips": [],
         "final_game_times": {},
         "discord_watchlist_cache": {},
+        "handled_command_ids": [],
     }
     if not path.exists():
         return default_state.copy()
@@ -870,6 +944,158 @@ def refresh_discord_watchlist_cache(
         "refreshed_at": datetime.now(timezone.utc).isoformat(),
     }
     return new_watchlist, True
+
+
+def _watchlist_preview(watchlist: dict[int, WatchPlayer], limit: int = 20) -> str:
+    names = sorted({wp.name for wp in watchlist.values()})
+    if not names:
+        return "(empty)"
+    preview = names[: max(1, limit)]
+    suffix = "" if len(names) <= len(preview) else f" ... (+{len(names) - len(preview)} more)"
+    return ", ".join(preview) + suffix
+
+
+def _build_tracked_games_summary(team_ids: set[int], target_date: date) -> str:
+    try:
+        all_games = game_schedule(target_date)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not fetch schedule: {exc}"
+    games = tracked_games_for_watchlist(all_games, team_ids)
+    if not games:
+        return "No tracked games scheduled today."
+
+    live = 0
+    pregame = 0
+    final = 0
+    postponed = 0
+    labels: list[str] = []
+    for game in games:
+        bucket = game_status_bucket(game)
+        if bucket == "live":
+            live += 1
+        elif bucket == "pregame":
+            pregame += 1
+        elif bucket == "final":
+            final += 1
+        elif bucket == "postponed":
+            postponed += 1
+        if len(labels) < 5:
+            labels.append(f"{game_label_from_schedule(game)} [{bucket}]")
+    return (
+        f"Tracked games: {len(games)} (live {live}, pregame {pregame}, final {final}, postponed {postponed})\n"
+        f"Examples: {'; '.join(labels)}"
+    )
+
+
+def process_discord_text_commands(
+    *,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    target_date: date,
+    bridge_id_map: dict[int, int],
+    base_watchlist: dict[int, WatchPlayer],
+    discord_watchlist: dict[int, WatchPlayer],
+    watchlist: dict[int, WatchPlayer],
+    team_ids: set[int],
+) -> tuple[dict[int, WatchPlayer], dict[int, WatchPlayer], set[int]]:
+    if not args.discord_command_channel_id.strip() or not args.discord_bot_token.strip():
+        return discord_watchlist, watchlist, team_ids
+
+    handled_ids = list(state.get("handled_command_ids", []))
+    handled_set = set(handled_ids)
+    prefix = args.discord_command_prefix.strip() or "!ot"
+    lower_prefix = prefix.lower()
+
+    try:
+        messages = fetch_discord_command_messages(
+            channel_id=args.discord_command_channel_id,
+            bot_token=args.discord_bot_token,
+            limit=max(1, args.discord_command_limit),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Discord command poll failed: {exc}")
+        return discord_watchlist, watchlist, team_ids
+
+    for message in messages:
+        if message.message_id in handled_set:
+            continue
+        content = message.content.strip()
+        if not content.lower().startswith(lower_prefix):
+            continue
+
+        command_text = content[len(prefix):].strip()
+        command = command_text.lower() if command_text else "help"
+        response = ""
+
+        if command in {"help", "?"}:
+            response = (
+                f"{prefix} help - show commands\n"
+                f"{prefix} status - notifier status\n"
+                f"{prefix} watchlist - preview tracked players\n"
+                f"{prefix} refresh - force Discord upload refresh\n"
+                f"{prefix} games - tracked games summary"
+            )
+        elif command == "status":
+            response = (
+                f"Watching {len(watchlist)} players across {len(team_ids)} teams for {target_date.isoformat()}.\n"
+                f"Intervals: live {args.poll_seconds}s, pregame {args.pregame_seconds}s, idle {args.idle_seconds}s.\n"
+                f"Watchlist refresh {args.watchlist_refresh_seconds}s, post-final poll {args.postfinal_poll_seconds}s."
+            )
+        elif command == "watchlist":
+            response = f"Watchlist ({len(watchlist)}): {_watchlist_preview(watchlist)}"
+        elif command == "games":
+            response = _build_tracked_games_summary(team_ids, target_date)
+        elif command == "refresh":
+            if not args.discord_html_channel_id.strip():
+                response = "No Discord HTML upload channel configured on this notifier."
+            else:
+                try:
+                    refreshed_discord_watchlist, changed = refresh_discord_watchlist_cache(
+                        state=state,
+                        channel_id=args.discord_html_channel_id,
+                        bot_token=args.discord_bot_token,
+                        bridge_id_map=bridge_id_map,
+                        role=args.ottoneu_role,
+                        limit=max(1, args.discord_html_limit),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    response = f"Refresh failed: {exc}"
+                else:
+                    if changed:
+                        discord_watchlist = refreshed_discord_watchlist
+                        watchlist = dict(base_watchlist)
+                        watchlist.update(discord_watchlist)
+                        team_ids = watched_team_ids(watchlist)
+                        state["announced_lineups"] = []
+                        response = (
+                            f"Loaded new upload watchlist with {len(discord_watchlist)} players. "
+                            f"Now tracking {len(watchlist)} total players."
+                        )
+                    else:
+                        response = (
+                            f"No newer upload found. Tracking {len(discord_watchlist)} Discord players "
+                            f"and {len(watchlist)} total players."
+                        )
+        else:
+            response = f"Unknown command '{command_text}'. Try: {prefix} help"
+
+        try:
+            send_discord_channel_message(
+                channel_id=args.discord_command_channel_id,
+                bot_token=args.discord_bot_token,
+                message=response,
+                reply_to_message_id=message.message_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Discord command response failed: {exc}")
+
+        handled_ids.append(message.message_id)
+        handled_set.add(message.message_id)
+
+    if len(handled_ids) > 500:
+        handled_ids = handled_ids[-500:]
+    state["handled_command_ids"] = handled_ids
+    return discord_watchlist, watchlist, team_ids
 
 
 def game_schedule(target_date: date) -> list[dict[str, Any]]:
@@ -1651,6 +1877,30 @@ def parse_args() -> argparse.Namespace:
         help="How many recent Discord messages to scan for HTML attachments",
     )
     parser.add_argument(
+        "--discord-command-channel-id",
+        type=str,
+        default=os.getenv("DISCORD_COMMAND_CHANNEL_ID", ""),
+        help="Discord channel ID used for text commands (e.g. !ot status)",
+    )
+    parser.add_argument(
+        "--discord-command-prefix",
+        type=str,
+        default=os.getenv("DISCORD_COMMAND_PREFIX", "!ot"),
+        help="Command prefix for Discord text commands",
+    )
+    parser.add_argument(
+        "--discord-command-limit",
+        type=int,
+        default=int(os.getenv("DISCORD_COMMAND_LIMIT", "20")),
+        help="How many recent command-channel messages to scan each command poll",
+    )
+    parser.add_argument(
+        "--discord-command-poll-seconds",
+        type=int,
+        default=int(os.getenv("DISCORD_COMMAND_POLL_SECONDS", "20")),
+        help="How often to poll for command messages in the command channel",
+    )
+    parser.add_argument(
         "--no-csv-watchlist",
         action="store_true",
         help="Ignore local watchlist CSV and use Ottoneu game URLs only",
@@ -1871,8 +2121,14 @@ def main() -> int:
     print(f"Idle poll interval: {args.idle_seconds}s")
     print(f"Watchlist refresh interval: {args.watchlist_refresh_seconds}s")
     print(f"Post-final highlight grace: {args.postfinal_highlight_seconds}s")
+    if args.discord_command_channel_id.strip():
+        print(
+            f"Command channel enabled: {args.discord_command_channel_id} "
+            f"(prefix '{args.discord_command_prefix}', poll {args.discord_command_poll_seconds}s)"
+        )
 
     next_watchlist_refresh_at = 0.0
+    next_command_poll_at = 0.0
 
     while True:
         target_date = fixed_target_date or date.today()
@@ -1904,6 +2160,19 @@ def main() -> int:
                     print(
                         f"Activated new Discord upload watchlist with {len(discord_watchlist)} players"
                     )
+
+        if args.discord_command_channel_id and now_ts >= next_command_poll_at:
+            next_command_poll_at = now_ts + max(10, args.discord_command_poll_seconds)
+            discord_watchlist, watchlist, team_ids = process_discord_text_commands(
+                state=state,
+                args=args,
+                target_date=target_date,
+                bridge_id_map=bridge_id_map,
+                base_watchlist=base_watchlist,
+                discord_watchlist=discord_watchlist,
+                watchlist=watchlist,
+                team_ids=team_ids,
+            )
 
         try:
             all_games = game_schedule(target_date)

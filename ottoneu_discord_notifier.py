@@ -994,7 +994,6 @@ def _discord_embed(
         },
         "footer": {
             "text": status,
-            "icon_url": _team_logo_url(home_abbr),
         },
     }
     if player_id is not None:
@@ -1239,6 +1238,37 @@ def _event_sabr_points(event_type: str, is_batter: bool = True) -> float:
         return lookup.get(event_type, 0.0)
 
 
+def _statcast_suffix(play: dict[str, Any]) -> str:
+    """Build optional Statcast metrics text (EV/LA) when available."""
+    events = play.get("playEvents", [])
+    if not isinstance(events, list):
+        return ""
+
+    hit_data = None
+    for event in reversed(events):
+        if not isinstance(event, dict):
+            continue
+        candidate = event.get("hitData")
+        if isinstance(candidate, dict):
+            hit_data = candidate
+            break
+    if not isinstance(hit_data, dict):
+        return ""
+
+    parts: list[str] = []
+    launch_speed = hit_data.get("launchSpeed")
+    if isinstance(launch_speed, (int, float)):
+        parts.append(f"EV {launch_speed:.1f} mph")
+
+    launch_angle = hit_data.get("launchAngle")
+    if isinstance(launch_angle, (int, float)):
+        parts.append(f"LA {launch_angle:.1f} deg")
+
+    if not parts:
+        return ""
+    return f" ({', '.join(parts)})"
+
+
 def process_game(
     game_pk: int,
     watchlist: dict[int, WatchPlayer],
@@ -1313,6 +1343,8 @@ def process_game(
                 if key not in sent_keys:
                     # Calculate SABR points for this event
                     event_points = _event_sabr_points(event_type, is_batter=True)
+                    statcast_suffix = _statcast_suffix(play)
+                    event_name = str(result.get("event") or "").strip() or event_type.replace("_", " ").title()
                     if batter_id not in running_points:
                         running_points[batter_id] = 0.0
                     running_points[batter_id] += event_points
@@ -1323,12 +1355,12 @@ def process_game(
                     event_emoji = EVENT_EMOJIS.get(event_type, "⚾")
                     send_webhook(
                         webhook_url,
-                        f"{event_emoji} {game_text}: {wp.name} - {msg}{points_str}",
+                        f"{event_emoji} {game_text}: {wp.name} - {msg}{statcast_suffix}{points_str}",
                         dry_run=dry_run,
                         embeds=[
                             _discord_embed(
-                                title=f"{event_emoji} {wp.name} Alert",
-                                description=f"{event_emoji} {msg}{points_str}",
+                                title=f"{wp.name} Alert - {event_name}",
+                                description=f"{event_emoji} {msg}{statcast_suffix}{points_str}",
                                 away_abbr=away_abbr,
                                 home_abbr=home_abbr,
                                 status=status,

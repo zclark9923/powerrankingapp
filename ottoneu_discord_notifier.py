@@ -698,16 +698,10 @@ def parse_ottoneu_player_ids(page_html: str) -> set[int]:
     """Extract starter-only Ottoneu player IDs from a saved matchup page.
 
     Includes rows marked as starters and excludes any player whose position cell is
-    Bench or Minors.
+    Bench or Minors.  Works regardless of attribute order in the <tr> tag.
+    Falls back to all player_row IDs if no starter-class rows are found (e.g.
+    if the HTML snapshot doesn't use the starter class).
     """
-    starter_ids = {
-        int(m.group(1))
-        for m in re.finditer(
-            r'<tr[^>]*\bclass="[^"]*\bstarter\b[^"]*"[^>]*\bid="player_row_(\d+)"',
-            page_html,
-            flags=re.IGNORECASE,
-        )
-    }
     excluded_ids = {
         int(m.group(1))
         for m in re.finditer(
@@ -716,7 +710,25 @@ def parse_ottoneu_player_ids(page_html: str) -> set[int]:
             flags=re.IGNORECASE,
         )
     }
-    return starter_ids - excluded_ids
+
+    # Collect every player_row <tr> opening tag, then check its class attribute.
+    starter_ids: set[int] = set()
+    all_row_ids: set[int] = set()
+    for m in re.finditer(
+        r'<tr([^>]*)\bid="player_row_(\d+)"([^>]*)>',
+        page_html,
+        flags=re.IGNORECASE,
+    ):
+        pid = int(m.group(2))
+        all_row_ids.add(pid)
+        # Reconstruct full attribute string and check for starter class
+        attrs = m.group(1) + m.group(3)
+        class_m = re.search(r'\bclass="([^"]*)"', attrs, re.IGNORECASE)
+        if class_m and re.search(r'\bstarter\b', class_m.group(1), re.IGNORECASE):
+            starter_ids.add(pid)
+
+    source_ids = starter_ids if starter_ids else all_row_ids
+    return source_ids - excluded_ids
 
 
 def load_leaderboard_name_map(path: Path) -> dict[str, int]:

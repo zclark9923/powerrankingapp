@@ -1161,34 +1161,27 @@ def refresh_discord_watchlist_cache(
     cache = state.get("discord_watchlist_cache", {})
     cached_watchlist = _deserialize_watchlist(cache.get("players"))
 
-    latest = fetch_latest_discord_html_attachment(
+    new_watchlist = load_watchlist_from_discord_html_attachments(
         channel_id=channel_id,
         bot_token=bot_token,
-        limit=limit,
-    )
-    if latest is None:
-        if cached_watchlist:
-            print("No new Discord upload found; keeping cached watchlist")
-        return cached_watchlist, False
-
-    same_upload = (
-        str(cache.get("message_id", "")).strip() == latest.message_id
-        and str(cache.get("upload_url", "")).strip() == latest.url
-    )
-    if same_upload and cached_watchlist:
-        return cached_watchlist, False
-
-    new_watchlist = load_watchlist_from_discord_attachment(
-        attachment=latest,
         bridge_id_map=bridge_id_map,
         role=role,
+        limit=limit,
     )
+    if not new_watchlist:
+        if cached_watchlist:
+            print("No Discord HTML uploads found; keeping cached watchlist")
+        return cached_watchlist, False
+
+    new_serialized = _serialize_watchlist(new_watchlist)
+    cached_serialized = cache.get("players") or []
+    if cached_watchlist and new_serialized == cached_serialized:
+        return cached_watchlist, False
+
     state["discord_watchlist_cache"] = {
-        "message_id": latest.message_id,
-        "created_at": latest.created_at,
-        "filename": latest.filename,
-        "upload_url": latest.url,
-        "players": _serialize_watchlist(new_watchlist),
+        "players": new_serialized,
+        "source": "discord_html_attachments",
+        "attachment_limit": limit,
         "refreshed_at": datetime.now(timezone.utc).isoformat(),
     }
     return new_watchlist, True

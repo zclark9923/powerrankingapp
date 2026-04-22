@@ -1663,16 +1663,19 @@ def _discord_embed(
     color: int,
     player_id: int | None = None,
 ) -> dict[str, Any]:
+    away_logo = _team_logo_url(away_abbr)
+    home_logo = _team_logo_url(home_abbr)
     embed: dict[str, Any] = {
         "title": title,
         "description": description,
         "color": color,
         "author": {
             "name": f"{away_abbr} @ {home_abbr}",
-            "icon_url": _team_logo_url(away_abbr),
+            "icon_url": away_logo,
         },
         "footer": {
             "text": status,
+            "icon_url": home_logo,
         },
     }
     if player_id is not None:
@@ -1723,6 +1726,19 @@ def _lineup_presence_ids(feed: dict[str, Any]) -> set[int]:
                     ids.add(int(key[2:]))
                 except ValueError:
                     continue
+    return ids
+
+
+def _starting_pitcher_ids(feed: dict[str, Any]) -> set[int]:
+    """Return all pitcher IDs (starters and relief) who appeared in the game."""
+    ids: set[int] = set()
+    teams = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    for side in ("home", "away"):
+        pitcher_ids = teams.get(side, {}).get("pitchers", [])
+        if isinstance(pitcher_ids, list):
+            for pid in pitcher_ids:
+                if isinstance(pid, int):
+                    ids.add(pid)
     return ids
 
 
@@ -1943,6 +1959,10 @@ def _statcast_suffix(play: dict[str, Any]) -> str:
     if isinstance(launch_angle, (int, float)):
         parts.append(f"LA {launch_angle:.1f} deg")
 
+    distance = hit_data.get("totalDistance")
+    if isinstance(distance, (int, float)):
+        parts.append(f"Dist {distance:.0f} ft")
+
     if not parts:
         return ""
     return f" ({', '.join(parts)})"
@@ -2110,8 +2130,17 @@ def process_game(
             outing_key = f"{game_pk}:pitcher_outing:{pid}"
             if outing_key in sent_keys:
                 continue
+            # Only announce outing complete if: (1) game is final, OR (2) a different pitcher is currently on mound
+            # But NOT if the pitcher is still actively pitching (current) and game isn't over
             if not is_final and current_pitcher_id == pid:
                 continue
+            # Also don't announce if the pitcher is still in the game's active pitcher list and game isn't final
+            # (this means they haven't actually been replaced yet)
+            if not is_final:
+                pitcher_ids = bs_teams.get(side, {}).get("pitchers", [])
+                if isinstance(pitcher_ids, list) and pid in pitcher_ids:
+                    # Pitcher is still in the game's pitcher list and game isn't final, so outing isn't complete
+                    continue
 
             so = int(pitching.get("strikeOuts", 0) or 0)
             bb = int(pitching.get("baseOnBalls", 0) or 0)
@@ -2205,21 +2234,25 @@ def process_game(
 
     # --- Highlight clips (fires as clips become available, even mid-game) ---
     seen_clips: set[str] = set(state.get("seen_clips", []))
+    starter_pitcher_ids = _starting_pitcher_ids(feed)
     for clip in _fetch_highlights(game_pk):
         clip_id = clip["clip_id"]
         if clip_id in seen_clips:
             continue
-        matching_pids = [pid for pid in clip["player_ids"] if pid in watchlist]
-        if not matching_pids:
+
+        watched_ids = [pid for pid in clip["player_ids"] if pid in watchlist]
+        if not watched_ids:
             continue
+
+        # Suppress videos when only watched starting pitchers are associated with the clip.
+        non_starter_matches = [pid for pid in watched_ids if pid not in starter_pitcher_ids]
+        if not non_starter_matches:
+            seen_clips.add(clip_id)
+            continue
+
         send_webhook(
             webhook_url,
-            f"{EVENT_EMOJIS['highlight']} {game_text}: {clip['headline']}",
-            dry_run=dry_run,
-        )
-        send_webhook(
-            webhook_url,
-            clip["mp4_url"],
+            f"{EVENT_EMOJIS['highlight']} {game_text}: {clip['headline']}\n{clip['mp4_url']}",
             dry_run=dry_run,
         )
         seen_clips.add(clip_id)

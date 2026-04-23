@@ -2221,6 +2221,9 @@ def process_game(
     nicknames: dict[int, str] | None = None,
 ) -> bool:
     feed = _http_json(LIVE_FEED_TEMPLATE.format(game_pk=game_pk))
+    if not isinstance(feed, dict):
+        print(f"Game {game_pk}: unexpected feed response (got {type(feed).__name__}), skipping")
+        return False
     game_text = _game_label(feed)
     status = _status_label(feed)
     teams = feed.get("gameData", {}).get("teams", {})

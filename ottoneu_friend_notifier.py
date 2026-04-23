@@ -29,6 +29,7 @@ import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from html.parser import HTMLParser
 from html import unescape
 from pathlib import Path
@@ -1760,6 +1761,15 @@ def tracked_games_for_watchlist(
     return tracked
 
 
+def _et_today() -> date:
+    """Return today's date in MLB's home timezone (America/New_York / ET).
+
+    Using ET prevents the UTC-midnight boundary problem where the server
+    rolls to the next UTC date while MLB is still playing ET-evening games.
+    """
+    return datetime.now(ZoneInfo("America/New_York")).date()
+
+
 def game_status_bucket(game: dict[str, Any]) -> str:
     abstract_state = str(game.get("status", {}).get("abstractGameState", "")).strip()
     detailed = str(game.get("status", {}).get("detailedState", "")).strip()
@@ -2617,7 +2627,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--date",
         type=str,
-        default=os.getenv("NOTIFIER_DATE", date.today().isoformat()),
+        default=os.getenv("NOTIFIER_DATE", _et_today().isoformat()),
         help="Target date in YYYY-MM-DD",
     )
     parser.add_argument(
@@ -2789,7 +2799,7 @@ def main() -> int:
             "Could not resolve watched players to MLB teams. Check mlbam_id values."
         )
 
-    initial_target_date = fixed_target_date or date.today()
+    initial_target_date = fixed_target_date or _et_today()
     _roll_state_for_date(state, initial_target_date)
     print(f"Watching {len(watchlist)} players for {initial_target_date.isoformat()}")
     print(f"Resolved {len(team_ids)} tracked MLB teams")
@@ -2831,7 +2841,7 @@ def main() -> int:
     next_command_poll_at = 0.0
 
     while True:
-        target_date = fixed_target_date or date.today()
+        target_date = fixed_target_date or _et_today()
         _roll_state_for_date(state, target_date)
 
         now_ts = time.time()

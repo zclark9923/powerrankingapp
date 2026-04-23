@@ -1654,7 +1654,14 @@ def process_discord_text_commands(
                     elif len(found_ids) > 1:
                         response = f"Multiple players match '{player_name}'. Be more specific."
                     else:
-                        response = f"Player '{player_name}' not found in watchlist."
+                        # Not in this notifier's watchlist — try MLB API so cross-lineup nicknames work
+                        mlbam_id = resolve_name_to_mlbam_id(player_name)
+                        if mlbam_id:
+                            nicknames[mlbam_id] = nickname
+                            save_nicknames(nicknames)
+                            response = f"Nickname set: {player_name} -> {nickname}"
+                        else:
+                            response = f"Player '{player_name}' not found in watchlist or MLB roster."
         elif command.startswith("removenickname "):
             remainder = command_text.split(" ", 1)[1].strip()
             if not remainder:
@@ -1678,7 +1685,16 @@ def process_discord_text_commands(
                 elif len(found_ids) > 1:
                     response = f"Multiple players match '{remainder}'. Be more specific."
                 else:
-                    response = f"Player '{remainder}' not found in watchlist."
+                    # Not in this notifier's watchlist — try MLB API
+                    mlbam_id = resolve_name_to_mlbam_id(remainder)
+                    if mlbam_id and mlbam_id in nicknames:
+                        del nicknames[mlbam_id]
+                        save_nicknames(nicknames)
+                        response = f"Nickname removed for {remainder}"
+                    elif mlbam_id:
+                        response = f"{remainder} has no nickname set."
+                    else:
+                        response = f"Player '{remainder}' not found in watchlist or MLB roster."
         elif command == "clearnicknames":
             if nicknames:
                 count = len(nicknames)

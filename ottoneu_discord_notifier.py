@@ -937,6 +937,8 @@ def fetch_discord_html_attachments(
                 html_files.append((filename, _http_text(attachment_url)))
             seen_urls.add(attachment_url)
 
+    return html_files
+
 
 def load_watchlist_from_discord_html_attachments(
     channel_id: str,

@@ -2036,6 +2036,8 @@ def _fetch_highlights(game_pk: int) -> list[dict]:
         content = _http_json(GAME_CONTENT_TEMPLATE.format(game_pk=game_pk))
     except Exception:
         return []
+    if not isinstance(content, dict):
+        return []
     items = content.get("highlights", {}).get("highlights", {}).get("items", [])
     clips = []
     for item in items:
@@ -2763,14 +2765,19 @@ def main() -> int:
         )
         if discord_watchlist:
             print(f"Loaded cached Discord watchlist with {len(discord_watchlist)} players")
-        discord_watchlist, _ = refresh_discord_watchlist_cache(
-            state=state,
-            channel_id=args.discord_html_channel_id,
-            bot_token=args.discord_bot_token,
-            bridge_id_map=bridge_id_map,
-            role=args.ottoneu_role,
-            limit=max(1, args.discord_html_limit),
-        )
+        try:
+            discord_watchlist, _ = refresh_discord_watchlist_cache(
+                state=state,
+                channel_id=args.discord_html_channel_id,
+                bot_token=args.discord_bot_token,
+                bridge_id_map=bridge_id_map,
+                role=args.ottoneu_role,
+                limit=max(1, args.discord_html_limit),
+            )
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            print(f"Startup Discord watchlist refresh failed (network): {exc}; using cached watchlist")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Startup Discord watchlist refresh error: {exc}; using cached watchlist")
 
     if args.ottoneu_game_url:
         scraped = load_watchlist_from_ottoneu_games(
